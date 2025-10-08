@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import io, os, json, re as _re, tempfile
 import pandas as pd
 
@@ -14,7 +13,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 # =========================
 # CONFIG — customize here
 # =========================
-GDRIVE_ROOT_ID = "17RMLol0SgHKMcbptSswdYFJjB0MeKCQH"
+GDRIVE_ROOT_ID = "17RMLol0SgHKMcbptSswdYFJjB0MeKCQH"  # <-- put a Shared Drive folder ID here
 CSV_IN_HEADER  = "Dewer - Open SalesOrderHeader - 9-28-2025.csv"
 CSV_IN_DETAIL  = "Dewer - OpenSalesOrderDetail - 9-28-2025.csv"
 CSV_OUT_HEADER = "PFS - Open Sales Order Header Draft - 10.7.2025.csv"
@@ -23,25 +22,53 @@ CSV_OUT_DETAIL = "PFS - Open Sales Order Detail Draft - 10-7-2025.csv"
 # =========================
 # Google Drive helpers
 # =========================
-def _drive_service():
+def _drive_service(impersonate_user: str | None = None):
     raw = Secret.load("gdrive-service-account").get()
     info = json.loads(raw) if isinstance(raw, str) else raw
     for k in ("type", "client_email", "private_key", "token_uri"):
         if k not in info:
             raise ValueError(f"Service account JSON missing '{k}'")
     scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = SACredentials.from_service_account_info(info, scopes=scopes)
+    if impersonate_user:
+        creds = SACredentials.from_service_account_info(
+            info, scopes=scopes, subject=impersonate_user
+        )
+    else:
+        creds = SACredentials.from_service_account_info(info, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+def _safe_name(name: str) -> str:
+    # escape single quotes for Drive query
+    return name.replace("'", "\\'")
+
 def _find_file_id(service, folder_id: str, name: str) -> str | None:
-    safe_name = name.replace("'", "\\'")
-    q = f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
+    q = f"'{folder_id}' in parents and name = '{_safe_name(name)}' and trashed = false"
     resp = service.files().list(
         q=q, fields="files(id,name)", pageSize=1,
         supportsAllDrives=True, includeItemsFromAllDrives=True
     ).execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
+
+def _get_folder_meta(service, folder_id: str) -> dict:
+    return service.files().get(
+        fileId=folder_id,
+        fields="id,name,mimeType,driveId",
+        supportsAllDrives=True
+    ).execute()
+
+def _assert_write_target_ok(service, folder_id: str, impersonate_user: str | None):
+    meta = _get_folder_meta(service, folder_id)
+    is_shared_drive = bool(meta.get("driveId"))
+    if not is_shared_drive and not impersonate_user:
+        # My Drive + plain service account => 403 storageQuotaExceeded
+        raise RuntimeError(
+            "Target folder is in a user's My Drive and the flow is using a service account "
+            "without impersonation. Service accounts have no personal storage quota.\n"
+            "➡ Fix it by either:\n"
+            "   • Using a Shared Drive folder (recommended), or\n"
+            "   • Enabling domain-wide delegation and setting impersonate_user to a Workspace user."
+        )
 
 def read_csv_from_drive(service, folder_id: str, filename: str, **base_kwargs) -> pd.DataFrame:
     file_id = _find_file_id(service, folder_id, filename)
@@ -55,7 +82,7 @@ def read_csv_from_drive(service, folder_id: str, filename: str, **base_kwargs) -
         _, done = downloader.next_chunk()
     buf.seek(0)
 
-    # Resilient decoding: cp1252 → cp1252+replace → latin-1
+    # Resilient decoding for Windows-ish exports
     attempts = [
         dict(encoding="cp1252", encoding_errors="strict"),
         dict(encoding="cp1252", encoding_errors="replace"),
@@ -73,34 +100,25 @@ def read_csv_from_drive(service, folder_id: str, filename: str, **base_kwargs) -
 def write_csv_to_drive_fast(service, folder_id: str, filename: str, df: pd.DataFrame):
     """
     Fast CSV writer:
-      - writes to a local temp csv (UTF-8 BOM for Excel)
-      - uploads with resumable chunks
-      - blanks for nulls (no 'None' or 'NaN')
+      - write local UTF-8 BOM CSV for Excel
+      - upload via resumable API
+      - blanks for nulls (no 'None'/'NaN')
     """
     with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", newline="") as tmp:
         tmp_path = tmp.name
-        # Ensure blanks for nulls, consistent newlines
         df.to_csv(tmp, index=False, na_rep="", encoding="utf-8-sig", lineterminator="\n")
-
     try:
         with open(tmp_path, "rb") as fh:
-            media = MediaIoBaseUpload(
-                fh,
-                mimetype="text/csv",
-                chunksize=10 * 1024 * 1024,  # 10MB
-                resumable=True,
-            )
+            media = MediaIoBaseUpload(fh, mimetype="text/csv", chunksize=10*1024*1024, resumable=True)
             file_id = _find_file_id(service, folder_id, filename)
             if file_id:
                 service.files().update(
-                    fileId=file_id, media_body=media,
-                    supportsAllDrives=True
+                    fileId=file_id, media_body=media, supportsAllDrives=True
                 ).execute()
             else:
                 service.files().create(
                     body={"name": filename, "parents": [folder_id]},
-                    media_body=media, fields="id",
-                    supportsAllDrives=True
+                    media_body=media, fields="id", supportsAllDrives=True
                 ).execute()
     finally:
         try: os.remove(tmp_path)
@@ -192,8 +210,8 @@ def coerce_dtypes(df: pd.DataFrame, dmap: dict) -> pd.DataFrame:
 # TASKS
 # ============
 @task(retries=2, retry_delay_seconds=5)
-def t_read_header(folder_id: str, file_name: str) -> pd.DataFrame:
-    s = _drive_service()
+def t_read_header(folder_id: str, file_name: str, impersonate_user: str | None) -> pd.DataFrame:
+    s = _drive_service(impersonate_user)
     df = read_csv_from_drive(
         s, folder_id, file_name,
         sep=",", quotechar='"', header=0,
@@ -209,14 +227,15 @@ def t_transform_header(df: pd.DataFrame) -> pd.DataFrame:
     return row_filter_78(column_filter(df))
 
 @task(retries=2, retry_delay_seconds=5)
-def t_write_header_csv(folder_id: str, out_name: str, df: pd.DataFrame):
-    s = _drive_service()
+def t_write_header_csv(folder_id: str, out_name: str, df: pd.DataFrame, impersonate_user: str | None):
+    s = _drive_service(impersonate_user)
+    _assert_write_target_ok(s, folder_id, impersonate_user)
     write_csv_to_drive_fast(s, folder_id, out_name, df)
     get_run_logger().info(f"Wrote CSV: {out_name} (rows={len(df):,})")
 
 @task(retries=2, retry_delay_seconds=5)
-def t_read_detail(folder_id: str, file_name: str) -> pd.DataFrame:
-    s = _drive_service()
+def t_read_detail(folder_id: str, file_name: str, impersonate_user: str | None) -> pd.DataFrame:
+    s = _drive_service(impersonate_user)
     df = read_csv_from_drive(
         s, folder_id, file_name,
         sep=",", quotechar='"', header=0,
@@ -232,8 +251,9 @@ def t_transform_detail(df: pd.DataFrame) -> pd.DataFrame:
     return row_filter_83(df)
 
 @task(retries=2, retry_delay_seconds=5)
-def t_write_detail_csv(folder_id: str, out_name: str, df: pd.DataFrame):
-    s = _drive_service()
+def t_write_detail_csv(folder_id: str, out_name: str, df: pd.DataFrame, impersonate_user: str | None):
+    s = _drive_service(impersonate_user)
+    _assert_write_target_ok(s, folder_id, impersonate_user)
     write_csv_to_drive_fast(s, folder_id, out_name, df)
     get_run_logger().info(f"Wrote CSV: {out_name} (rows={len(df):,})")
 
@@ -247,16 +267,17 @@ def pfs_sales_flow(
     csv_in_detail: str = CSV_IN_DETAIL,
     csv_out_header: str = CSV_OUT_HEADER,
     csv_out_detail: str = CSV_OUT_DETAIL,
+    impersonate_user: str | None = None,    # <-- set to "you@domain.com" if using DWD
 ):
     # Header branch (parallel)
-    h_raw = t_read_header.submit(gdrive_root_id, csv_in_header)
+    h_raw = t_read_header.submit(gdrive_root_id, csv_in_header, impersonate_user)
     h_trn = t_transform_header.submit(h_raw)
-    h_wrt = t_write_header_csv.submit(gdrive_root_id, csv_out_header, h_trn)
+    h_wrt = t_write_header_csv.submit(gdrive_root_id, csv_out_header, h_trn, impersonate_user)
 
     # Detail branch (parallel)
-    d_raw = t_read_detail.submit(gdrive_root_id, csv_in_detail)
+    d_raw = t_read_detail.submit(gdrive_root_id, csv_in_detail, impersonate_user)
     d_trn = t_transform_detail.submit(d_raw)
-    d_wrt = t_write_detail_csv.submit(gdrive_root_id, csv_out_detail, d_trn)
+    d_wrt = t_write_detail_csv.submit(gdrive_root_id, csv_out_detail, d_trn, impersonate_user)
 
     # Wait for both
     h_wrt.result()
