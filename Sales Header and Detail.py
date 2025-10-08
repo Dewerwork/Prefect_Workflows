@@ -40,8 +40,18 @@ def _drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def _find_file_id(service, folder_id: str, name: str) -> str | None:
-    q = f"'{folder_id}' in parents and name = '{name.replace(\"'\", \"\\'\")}' and trashed = false"
-    resp = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    # Escape single quotes for the Drive query language (strings are quoted with single quotes)
+    safe_name = name.replace("'", "\\'")
+    q = f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
+
+    resp = service.files().list(
+        q=q,
+        fields="files(id,name)",
+        pageSize=1,
+        supportsAllDrives=True,         # in case the folder is on a shared drive
+        includeItemsFromAllDrives=True,
+    ).execute()
+
     files = resp.get("files", [])
     return files[0]["id"] if files else None
 
