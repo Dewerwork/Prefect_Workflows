@@ -1,14 +1,17 @@
-from pathlib import Path
-import pandas as pd
+from __future__ import annotations
+
+import io
+import json
+import os
 import re as _re
-import tempfile, os, json
+import pandas as pd
 
 from prefect import flow, task, get_run_logger
 from prefect.blocks.system import Secret
-from datetime import timedelta
 
-# Only import the fs interface; do NOT build google.oauth2 objects yourself.
-from gdrive_fsspec import GoogleDriveFileSystem
+from google.oauth2.service_account import Credentials as SACredentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # =========================
 # CONFIG — customize here
@@ -19,62 +22,77 @@ CSV_IN_DETAIL  = "Dewer - OpenSalesOrderDetail - 9-28-2025.csv"
 XLS_OUT_HEADER = "PFS - Open Sales Order Header Draft - 10.7.2025.xlsx"
 XLS_OUT_DETAIL = "PFS - Open Sales Order Detail Draft - 10-7-2025.xlsx"
 
-# ==============
-# Drive helpers
-# ==============
-def make_fs(gdrive_root_id: str) -> GoogleDriveFileSystem:
-    """
-    Build a GoogleDriveFileSystem using a service-account JSON **dict**
-    stored in the Prefect Secret block 'gdrive-service-account'.
-    """
-    sa_json = Secret.load("gdrive-service-account").get()
-    info = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
+# =========================
+# Google Drive helpers
+# =========================
+def _drive_service():
+    # Load service account JSON from Prefect Secret (block name must exist)
+    raw = Secret.load("gdrive-service-account").get()
+    info = json.loads(raw) if isinstance(raw, str) else raw
 
-    # quick sanity check to avoid silent fallback to browser OAuth
-    required = {"type", "client_email", "private_key", "token_uri"}
-    missing = [k for k in required if k not in info]
-    if missing:
-        raise ValueError(f"Service-account JSON missing keys: {missing}")
+    # Validate basic fields to avoid silent fallbacks
+    for key in ("type", "client_email", "private_key", "token_uri"):
+        if key not in info:
+            raise ValueError(f"Service account JSON missing '{key}'")
 
-    # Pass the dict directly as `creds=`; this triggers service-account auth.
-    return GoogleDriveFileSystem(creds=info, root_file_id=gdrive_root_id)
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = SACredentials.from_service_account_info(info, scopes=scopes)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def read_gdrive_csv_resilient(fs: GoogleDriveFileSystem, filename: str, **base_kwargs) -> pd.DataFrame:
-    """Try cp1252, then cp1252+replace, then latin-1; no chunking."""
+def _find_file_id(service, folder_id: str, name: str) -> str | None:
+    q = f"'{folder_id}' in parents and name = '{name.replace(\"'\", \"\\'\")}' and trashed = false"
+    resp = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    files = resp.get("files", [])
+    return files[0]["id"] if files else None
+
+def read_csv_from_drive(service, folder_id: str, filename: str, **base_kwargs) -> pd.DataFrame:
+    file_id = _find_file_id(service, folder_id, filename)
+    if not file_id:
+        raise FileNotFoundError(f"File not found in folder: {filename}")
+
+    req = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    buf.seek(0)
+
+    # Resilient decoding: cp1252 → cp1252+replace → latin-1
     attempts = [
         dict(encoding="cp1252", encoding_errors="strict"),
         dict(encoding="cp1252", encoding_errors="replace"),
         dict(encoding="latin-1", encoding_errors="strict"),
     ]
     last_err = None
-    for enc_kw in attempts:
+    for enc in attempts:
         try:
-            with fs.open(filename, "rb") as f:
-                return pd.read_csv(f, **base_kwargs, **enc_kw)
+            buf.seek(0)
+            return pd.read_csv(buf, **base_kwargs, **enc)
         except UnicodeDecodeError as e:
             last_err = e
     raise last_err
 
-def write_gdrive_excel_atomic(fs: GoogleDriveFileSystem, filename: str, df: pd.DataFrame,
-                              sheet_name="default_1"):
-    """
-    Write to a local temp .xlsx then upload once; avoids streaming SSL hiccups.
-    Writes blanks for NA values.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        with pd.ExcelWriter(tmp_path, engine="openpyxl", mode="w") as xw:
-            # na_rep="" ensures truly blank cells for null values
-            df.to_excel(xw, sheet_name=sheet_name, header=True, index=False, na_rep="")
-        # Upload in one shot
-        put = getattr(fs, "put", None) or getattr(fs, "put_file", None)
-        put(tmp_path, filename)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+def write_excel_to_drive(service, folder_id: str, filename: str, df: pd.DataFrame, sheet_name="default_1"):
+    # Create xlsx in-memory, then upload/replace by name
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl", mode="w") as xw:
+        df.to_excel(xw, sheet_name=sheet_name, header=True, index=False, na_rep="")
+    out.seek(0)
+
+    media = MediaIoBaseUpload(
+        out,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        resumable=False,
+    )
+
+    file_id = _find_file_id(service, folder_id, filename)
+    if file_id:
+        service.files().update(fileId=file_id, media_body=media).execute()
+    else:
+        body = {"name": filename, "parents": [folder_id]}
+        service.files().create(body=body, media_body=media, fields="id").execute()
 
 # =================
 # KNIME-ish shims
@@ -92,7 +110,6 @@ def _rf_resolve(df: pd.DataFrame, name: str | None) -> str | None:
     return nmap.get(_rf_norm_name(name))
 
 def row_filter_78(df: pd.DataFrame) -> pd.DataFrame:
-    # Your KNIME node 78 was effectively “neutral”
     return df.copy()
 
 def row_filter_83(df: pd.DataFrame) -> pd.DataFrame:
@@ -148,7 +165,8 @@ DTYPES_82 = {'Order Number': 'Int64', 'Product Number': 'string', 'Product Descr
 
 def coerce_dtypes(df: pd.DataFrame, dmap: dict) -> pd.DataFrame:
     for _col, _dt in dmap.items():
-        if _col not in df.columns: continue
+        if _col not in df.columns:
+            continue
         try:
             if _dt in ('Int64', 'Float64'):
                 df[_col] = pd.to_numeric(df[_col], errors='coerce').astype(_dt)
@@ -162,16 +180,16 @@ def coerce_dtypes(df: pd.DataFrame, dmap: dict) -> pd.DataFrame:
 # TASKS
 # ============
 @task(retries=2, retry_delay_seconds=5)
-def t_read_header(fs, csv_name: str) -> pd.DataFrame:
-    logger = get_run_logger()
-    df = read_gdrive_csv_resilient(
-        fs, csv_name,
+def t_read_header(folder_id: str, file_name: str) -> pd.DataFrame:
+    s = _drive_service()
+    df = read_csv_from_drive(
+        s, folder_id, file_name,
         sep=",", quotechar='"', header=0,
         na_values=["", " "], keep_default_na=True, skipinitialspace=True,
         low_memory=False,
     )
     df = coerce_dtypes(df, DTYPES_74)
-    logger.info(f"[header] loaded {len(df):,} rows from {csv_name}")
+    get_run_logger().info(f"[header] loaded {len(df):,} rows from {file_name}")
     return df
 
 @task
@@ -179,21 +197,22 @@ def t_transform_header(df: pd.DataFrame) -> pd.DataFrame:
     return row_filter_78(column_filter(df))
 
 @task(retries=2, retry_delay_seconds=5)
-def t_write_header(fs, df: pd.DataFrame, xls_name: str):
-    write_gdrive_excel_atomic(fs, xls_name, df, sheet_name="default_1")
+def t_write_header(folder_id: str, xls_name: str, df: pd.DataFrame):
+    s = _drive_service()
+    write_excel_to_drive(s, folder_id, xls_name, df)
     get_run_logger().info(f"Wrote Excel: {xls_name} (rows={len(df):,})")
 
 @task(retries=2, retry_delay_seconds=5)
-def t_read_detail(fs, csv_name: str) -> pd.DataFrame:
-    logger = get_run_logger()
-    df = read_gdrive_csv_resilient(
-        fs, csv_name,
+def t_read_detail(folder_id: str, file_name: str) -> pd.DataFrame:
+    s = _drive_service()
+    df = read_csv_from_drive(
+        s, folder_id, file_name,
         sep=",", quotechar='"', header=0,
         na_values=["", " "], keep_default_na=True, skipinitialspace=True,
         low_memory=False,
     )
     df = coerce_dtypes(df, DTYPES_82)
-    logger.info(f"[detail] loaded {len(df):,} rows from {csv_name}")
+    get_run_logger().info(f"[detail] loaded {len(df):,} rows from {file_name}")
     return df
 
 @task
@@ -201,8 +220,9 @@ def t_transform_detail(df: pd.DataFrame) -> pd.DataFrame:
     return row_filter_83(df)
 
 @task(retries=2, retry_delay_seconds=5)
-def t_write_detail(fs, df: pd.DataFrame, xls_name: str):
-    write_gdrive_excel_atomic(fs, xls_name, df, sheet_name="default_1")
+def t_write_detail(folder_id: str, xls_name: str, df: pd.DataFrame):
+    s = _drive_service()
+    write_excel_to_drive(s, folder_id, xls_name, df)
     get_run_logger().info(f"Wrote Excel: {xls_name} (rows={len(df):,})")
 
 # ============
@@ -217,23 +237,14 @@ def pfs_sales_flow(
     xls_out_detail: str = XLS_OUT_DETAIL,
 ):
     logger = get_run_logger()
-    fs = make_fs(gdrive_root_id)  # ← service-account auth (no browser)
-
-    # Optional: show folder contents once
-    try:
-        logger.info(f"Drive folder listing: {fs.ls('')}")
-    except Exception as e:
-        logger.warning(f"Could not list folder: {e}")
 
     # Header branch
-    df_header_raw = t_read_header(fs, csv_in_header)
-    df_header     = t_transform_header(df_header_raw)
-    t_write_header(fs, df_header, xls_out_header)
+    df_header = t_transform_header(t_read_header(gdrive_root_id, csv_in_header))
+    t_write_header(gdrive_root_id, xls_out_header, df_header)
 
     # Detail branch
-    df_detail_raw = t_read_detail(fs, csv_in_detail)
-    df_detail     = t_transform_detail(df_detail_raw)
-    t_write_detail(fs, df_detail, xls_out_detail)
+    df_detail = t_transform_detail(t_read_detail(gdrive_root_id, csv_in_detail))
+    t_write_detail(gdrive_root_id, xls_out_detail, df_detail)
 
     logger.info("Flow completed ✅")
 
