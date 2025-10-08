@@ -3,6 +3,11 @@ import pandas as pd
 import re as _re
 import tempfile, os, json
 
+import json
+from prefect.blocks.system import Secret
+from google.oauth2.service_account import Credentials as SACredentials
+from gdrive_fsspec import GoogleDriveFileSystem
+
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from datetime import timedelta
@@ -22,14 +27,23 @@ XLS_OUT_DETAIL = "PFS - Open Sales Order Detail Draft - 10-7-2025.xlsx"
 # ==============
 # Drive helpers
 # ==============
+# --- replace your make_fs with this exact version ---
 def make_fs(gdrive_root_id: str) -> GoogleDriveFileSystem:
     """
-    Build a GoogleDriveFileSystem using a service account JSON stored in a Prefect Secret block.
-    Secret block name: gdrive-service-account
+    Build a GoogleDriveFileSystem using a service-account key stored in
+    the Prefect Secret block named 'gdrive-service-account'.
     """
+    # 1) Load service-account JSON from Prefect
     sa_json = Secret.load("gdrive-service-account").get()
-    sa_creds = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
-    return GoogleDriveFileSystem(creds=sa_creds, root_file_id=gdrive_root_id)
+    info = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
+
+    # 2) Create a google.auth Credentials object with Drive scope
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds_obj = SACredentials.from_service_account_info(info, scopes=scopes)
+
+    # 3) Hand those credentials to gdrive-fsspec (this avoids any browser flow)
+    return GoogleDriveFileSystem(creds=creds_obj, root_file_id=gdrive_root_id)
+
 
 def gdrive_list(fs: GoogleDriveFileSystem):
     try:
@@ -226,7 +240,7 @@ def pfs_sales_flow(
 ):
     logger = get_run_logger()
     # ✅ SERVICE ACCOUNT (no browser)
-    fs = make_fs(gdrive_root_id)
+    fs = make_fs(gdrive_root_id)  # <— service-account auth, no browser
 
     # Optional: show folder contents once
     try:
