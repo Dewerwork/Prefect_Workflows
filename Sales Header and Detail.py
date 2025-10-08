@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import io
-import json
-import os
-import re as _re
+import io, os, json, re as _re, tempfile
 import pandas as pd
 
 from prefect import flow, task, get_run_logger
 from prefect.blocks.system import Secret
+from prefect.task_runners import ConcurrentTaskRunner
 
 from google.oauth2.service_account import Credentials as SACredentials
 from googleapiclient.discovery import build
@@ -16,42 +14,32 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 # =========================
 # CONFIG — customize here
 # =========================
-GDRIVE_ROOT_ID = "17RMLol0SgHKMcbptSswdYFJjB0MeKCQH"  # Drive folder ID
+GDRIVE_ROOT_ID = "17RMLol0SgHKMcbptSswdYFJjB0MeKCQH"
 CSV_IN_HEADER  = "Dewer - Open SalesOrderHeader - 9-28-2025.csv"
 CSV_IN_DETAIL  = "Dewer - OpenSalesOrderDetail - 9-28-2025.csv"
-XLS_OUT_HEADER = "PFS - Open Sales Order Header Draft - 10.7.2025.xlsx"
-XLS_OUT_DETAIL = "PFS - Open Sales Order Detail Draft - 10-7-2025.xlsx"
+CSV_OUT_HEADER = "PFS - Open Sales Order Header Draft - 10.7.2025.csv"
+CSV_OUT_DETAIL = "PFS - Open Sales Order Detail Draft - 10-7-2025.csv"
 
 # =========================
 # Google Drive helpers
 # =========================
 def _drive_service():
-    # Load service account JSON from Prefect Secret (block name must exist)
     raw = Secret.load("gdrive-service-account").get()
     info = json.loads(raw) if isinstance(raw, str) else raw
-
-    # Validate basic fields to avoid silent fallbacks
-    for key in ("type", "client_email", "private_key", "token_uri"):
-        if key not in info:
-            raise ValueError(f"Service account JSON missing '{key}'")
-
+    for k in ("type", "client_email", "private_key", "token_uri"):
+        if k not in info:
+            raise ValueError(f"Service account JSON missing '{k}'")
     scopes = ["https://www.googleapis.com/auth/drive"]
     creds = SACredentials.from_service_account_info(info, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def _find_file_id(service, folder_id: str, name: str) -> str | None:
-    # Escape single quotes for the Drive query language (strings are quoted with single quotes)
     safe_name = name.replace("'", "\\'")
     q = f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
-
     resp = service.files().list(
-        q=q,
-        fields="files(id,name)",
-        pageSize=1,
-        supportsAllDrives=True,         # in case the folder is on a shared drive
-        includeItemsFromAllDrives=True,
+        q=q, fields="files(id,name)", pageSize=1,
+        supportsAllDrives=True, includeItemsFromAllDrives=True
     ).execute()
-
     files = resp.get("files", [])
     return files[0]["id"] if files else None
 
@@ -59,21 +47,19 @@ def read_csv_from_drive(service, folder_id: str, filename: str, **base_kwargs) -
     file_id = _find_file_id(service, folder_id, filename)
     if not file_id:
         raise FileNotFoundError(f"File not found in folder: {filename}")
-
     req = service.files().get_media(fileId=file_id)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
         _, done = downloader.next_chunk()
-
     buf.seek(0)
 
     # Resilient decoding: cp1252 → cp1252+replace → latin-1
     attempts = [
         dict(encoding="cp1252", encoding_errors="strict"),
         dict(encoding="cp1252", encoding_errors="replace"),
-        dict(encoding="latin-1", encoding_errors="strict"),
+        dict(encoding="latin-1",  encoding_errors="strict"),
     ]
     last_err = None
     for enc in attempts:
@@ -84,25 +70,41 @@ def read_csv_from_drive(service, folder_id: str, filename: str, **base_kwargs) -
             last_err = e
     raise last_err
 
-def write_excel_to_drive(service, folder_id: str, filename: str, df: pd.DataFrame, sheet_name="default_1"):
-    # Create xlsx in-memory, then upload/replace by name
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl", mode="w") as xw:
-        df.to_excel(xw, sheet_name=sheet_name, header=True, index=False, na_rep="")
-    out.seek(0)
+def write_csv_to_drive_fast(service, folder_id: str, filename: str, df: pd.DataFrame):
+    """
+    Fast CSV writer:
+      - writes to a local temp csv (UTF-8 BOM for Excel)
+      - uploads with resumable chunks
+      - blanks for nulls (no 'None' or 'NaN')
+    """
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", newline="") as tmp:
+        tmp_path = tmp.name
+        # Ensure blanks for nulls, consistent newlines
+        df.to_csv(tmp, index=False, na_rep="", encoding="utf-8-sig", lineterminator="\n")
 
-    media = MediaIoBaseUpload(
-        out,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        resumable=False,
-    )
-
-    file_id = _find_file_id(service, folder_id, filename)
-    if file_id:
-        service.files().update(fileId=file_id, media_body=media).execute()
-    else:
-        body = {"name": filename, "parents": [folder_id]}
-        service.files().create(body=body, media_body=media, fields="id").execute()
+    try:
+        with open(tmp_path, "rb") as fh:
+            media = MediaIoBaseUpload(
+                fh,
+                mimetype="text/csv",
+                chunksize=10 * 1024 * 1024,  # 10MB
+                resumable=True,
+            )
+            file_id = _find_file_id(service, folder_id, filename)
+            if file_id:
+                service.files().update(
+                    fileId=file_id, media_body=media,
+                    supportsAllDrives=True
+                ).execute()
+            else:
+                service.files().create(
+                    body={"name": filename, "parents": [folder_id]},
+                    media_body=media, fields="id",
+                    supportsAllDrives=True
+                ).execute()
+    finally:
+        try: os.remove(tmp_path)
+        except OSError: pass
 
 # =================
 # KNIME-ish shims
@@ -127,7 +129,7 @@ def row_filter_83(df: pd.DataFrame) -> pd.DataFrame:
     col_num  = _rf_resolve(df, 'Product Number')
     mask = pd.Series(True, index=df.index)
     if col_desc in df.columns: mask &= df[col_desc].notna()
-    if col_num in df.columns:  mask &= df[col_num].notna()
+    if col_num  in df.columns: mask &= df[col_num].notna()
     return df[mask].copy()
 
 # ===================
@@ -207,10 +209,10 @@ def t_transform_header(df: pd.DataFrame) -> pd.DataFrame:
     return row_filter_78(column_filter(df))
 
 @task(retries=2, retry_delay_seconds=5)
-def t_write_header(folder_id: str, xls_name: str, df: pd.DataFrame):
+def t_write_header_csv(folder_id: str, out_name: str, df: pd.DataFrame):
     s = _drive_service()
-    write_excel_to_drive(s, folder_id, xls_name, df)
-    get_run_logger().info(f"Wrote Excel: {xls_name} (rows={len(df):,})")
+    write_csv_to_drive_fast(s, folder_id, out_name, df)
+    get_run_logger().info(f"Wrote CSV: {out_name} (rows={len(df):,})")
 
 @task(retries=2, retry_delay_seconds=5)
 def t_read_detail(folder_id: str, file_name: str) -> pd.DataFrame:
@@ -230,33 +232,36 @@ def t_transform_detail(df: pd.DataFrame) -> pd.DataFrame:
     return row_filter_83(df)
 
 @task(retries=2, retry_delay_seconds=5)
-def t_write_detail(folder_id: str, xls_name: str, df: pd.DataFrame):
+def t_write_detail_csv(folder_id: str, out_name: str, df: pd.DataFrame):
     s = _drive_service()
-    write_excel_to_drive(s, folder_id, xls_name, df)
-    get_run_logger().info(f"Wrote Excel: {xls_name} (rows={len(df):,})")
+    write_csv_to_drive_fast(s, folder_id, out_name, df)
+    get_run_logger().info(f"Wrote CSV: {out_name} (rows={len(df):,})")
 
 # ============
 # FLOW
 # ============
-@flow(name="PFS Sales (Drive → Excel)")
+@flow(name="PFS Sales (Drive → CSV)", task_runner=ConcurrentTaskRunner())
 def pfs_sales_flow(
     gdrive_root_id: str = GDRIVE_ROOT_ID,
     csv_in_header: str = CSV_IN_HEADER,
     csv_in_detail: str = CSV_IN_DETAIL,
-    xls_out_header: str = XLS_OUT_HEADER,
-    xls_out_detail: str = XLS_OUT_DETAIL,
+    csv_out_header: str = CSV_OUT_HEADER,
+    csv_out_detail: str = CSV_OUT_DETAIL,
 ):
-    logger = get_run_logger()
+    # Header branch (parallel)
+    h_raw = t_read_header.submit(gdrive_root_id, csv_in_header)
+    h_trn = t_transform_header.submit(h_raw)
+    h_wrt = t_write_header_csv.submit(gdrive_root_id, csv_out_header, h_trn)
 
-    # Header branch
-    df_header = t_transform_header(t_read_header(gdrive_root_id, csv_in_header))
-    t_write_header(gdrive_root_id, xls_out_header, df_header)
+    # Detail branch (parallel)
+    d_raw = t_read_detail.submit(gdrive_root_id, csv_in_detail)
+    d_trn = t_transform_detail.submit(d_raw)
+    d_wrt = t_write_detail_csv.submit(gdrive_root_id, csv_out_detail, d_trn)
 
-    # Detail branch
-    df_detail = t_transform_detail(t_read_detail(gdrive_root_id, csv_in_detail))
-    t_write_detail(gdrive_root_id, xls_out_detail, df_detail)
-
-    logger.info("Flow completed ✅")
+    # Wait for both
+    h_wrt.result()
+    d_wrt.result()
+    get_run_logger().info("Flow completed ✅")
 
 if __name__ == "__main__":
     pfs_sales_flow()
