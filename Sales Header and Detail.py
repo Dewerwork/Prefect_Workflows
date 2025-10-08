@@ -1,20 +1,19 @@
-# PFS Sales (Drive → Excel) — Prefect flow (service-account via ADC, no browser)
-# Runtime deps: gdrive-fsspec, fsspec, google-auth, pandas, openpyxl, prefect
-
-import os
-import json
-import tempfile
+from pathlib import Path
 import pandas as pd
 import re as _re
+import tempfile, os, json
 
 from prefect import flow, task, get_run_logger
 from prefect.blocks.system import Secret
+from datetime import timedelta
+
+# Only import the fs interface; do NOT build google.oauth2 objects yourself.
 from gdrive_fsspec import GoogleDriveFileSystem
 
 # =========================
 # CONFIG — customize here
 # =========================
-GDRIVE_ROOT_ID = "17RMLol0SgHKMcbptSswdYFJjB0MeKCQH"  # Drive folder ID (share it with the SA)
+GDRIVE_ROOT_ID = "17RMLol0SgHKMcbptSswdYFJjB0MeKCQH"  # Drive folder ID
 CSV_IN_HEADER  = "Dewer - Open SalesOrderHeader - 9-28-2025.csv"
 CSV_IN_DETAIL  = "Dewer - OpenSalesOrderDetail - 9-28-2025.csv"
 XLS_OUT_HEADER = "PFS - Open Sales Order Header Draft - 10.7.2025.xlsx"
@@ -23,68 +22,25 @@ XLS_OUT_DETAIL = "PFS - Open Sales Order Detail Draft - 10-7-2025.xlsx"
 # ==============
 # Drive helpers
 # ==============
-def _install_adc_env_from_secret(secret_block_name: str) -> str:
-    """
-    Writes the service-account JSON (from Prefect Secret block) to a temp file and
-    points GOOGLE_APPLICATION_CREDENTIALS to it for Application Default Credentials.
-    Returns the temp file path (do not delete until process exit).
-    """
-    raw = Secret.load(secret_block_name).get()
-    info = json.loads(raw) if isinstance(raw, str) else raw
-
-    # Minimal validation (no secrets logged)
-    required = {"type", "client_email", "private_key", "token_uri"}
-    missing = required - set(info.keys())
-    if info.get("type") != "service_account" or missing:
-        raise ValueError(
-            f"Invalid service-account JSON in Secret '{secret_block_name}': "
-            f"type={info.get('type')!r}, missing={sorted(missing)}"
-        )
-
-    # Write to a stable temp path for this process
-    tmp_dir = tempfile.gettempdir()
-    tmp_path = os.path.join(tmp_dir, "prefect_gdrive_sa.json")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(info, f)
-
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
-    return tmp_path
-
 def make_fs(gdrive_root_id: str) -> GoogleDriveFileSystem:
     """
-    Build a GoogleDriveFileSystem using ADC (no browser).
-    We load the service-account JSON from Prefect Secret 'gdrive-service-account',
-    write it to a temp file, set GOOGLE_APPLICATION_CREDENTIALS, then use token="cloud".
+    Build a GoogleDriveFileSystem using a service-account JSON **dict**
+    stored in the Prefect Secret block 'gdrive-service-account'.
     """
-    _install_adc_env_from_secret("gdrive-service-account")
-    # Older gdrive-fsspecs understand "cloud" (ADC) and will NOT try a browser.
-    return GoogleDriveFileSystem(token="cloud", root_file_id=gdrive_root_id)
+    sa_json = Secret.load("gdrive-service-account").get()
+    info = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
 
-def write_gdrive_excel_atomic(fs, filename: str, df: pd.DataFrame,
-                              sheet_name="default_1", mode="w"):
-    """
-    Write Excel locally, then upload in one shot to avoid long SSL streams.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        with pd.ExcelWriter(tmp_path, engine="openpyxl", mode="w") as xw:
-            # blank cells instead of literal "None"
-            df.to_excel(xw, sheet_name=sheet_name, header=True, index=False, na_rep="")
-        try:
-            fs.put(tmp_path, filename)      # fsspec >= 2023
-        except AttributeError:
-            fs.put_file(tmp_path, filename) # older fsspec fallback
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+    # quick sanity check to avoid silent fallback to browser OAuth
+    required = {"type", "client_email", "private_key", "token_uri"}
+    missing = [k for k in required if k not in info]
+    if missing:
+        raise ValueError(f"Service-account JSON missing keys: {missing}")
 
-def read_gdrive_csv_resilient(fs, filename: str, **base_kwargs) -> pd.DataFrame:
-    """
-    Resilient CSV reader: cp1252 → cp1252+replace → latin-1
-    """
+    # Pass the dict directly as `creds=`; this triggers service-account auth.
+    return GoogleDriveFileSystem(creds=info, root_file_id=gdrive_root_id)
+
+def read_gdrive_csv_resilient(fs: GoogleDriveFileSystem, filename: str, **base_kwargs) -> pd.DataFrame:
+    """Try cp1252, then cp1252+replace, then latin-1; no chunking."""
     attempts = [
         dict(encoding="cp1252", encoding_errors="strict"),
         dict(encoding="cp1252", encoding_errors="replace"),
@@ -99,37 +55,52 @@ def read_gdrive_csv_resilient(fs, filename: str, **base_kwargs) -> pd.DataFrame:
             last_err = e
     raise last_err
 
+def write_gdrive_excel_atomic(fs: GoogleDriveFileSystem, filename: str, df: pd.DataFrame,
+                              sheet_name="default_1"):
+    """
+    Write to a local temp .xlsx then upload once; avoids streaming SSL hiccups.
+    Writes blanks for NA values.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        with pd.ExcelWriter(tmp_path, engine="openpyxl", mode="w") as xw:
+            # na_rep="" ensures truly blank cells for null values
+            df.to_excel(xw, sheet_name=sheet_name, header=True, index=False, na_rep="")
+        # Upload in one shot
+        put = getattr(fs, "put", None) or getattr(fs, "put_file", None)
+        put(tmp_path, filename)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
 # =================
 # KNIME-ish shims
 # =================
 def column_filter(df: pd.DataFrame) -> pd.DataFrame:
-    exclude_cols = ['Ship Via Code (#1)']
-    return df.drop(columns=[c for c in exclude_cols if c in df.columns], errors='ignore')
+    return df.drop(columns=[c for c in ['Ship Via Code (#1)'] if c in df.columns], errors='ignore')
 
 def _rf_norm_name(s): return _re.sub(r'[^a-z0-9]+', '', str(s).lower())
-
 def _rf_resolve(df: pd.DataFrame, name: str | None) -> str | None:
-    if name is None:
-        return None
-    if name in df.columns:
-        return name
+    if not name: return None
+    if name in df.columns: return name
     lmap = {c.lower(): c for c in df.columns}
-    if name.lower() in lmap:
-        return lmap[name.lower()]
+    if name.lower() in lmap: return lmap[name.lower()]
     nmap = {_rf_norm_name(c): c for c in df.columns}
     return nmap.get(_rf_norm_name(name))
 
 def row_filter_78(df: pd.DataFrame) -> pd.DataFrame:
+    # Your KNIME node 78 was effectively “neutral”
     return df.copy()
 
 def row_filter_83(df: pd.DataFrame) -> pd.DataFrame:
     col_desc = _rf_resolve(df, 'Product Description')
     col_num  = _rf_resolve(df, 'Product Number')
     mask = pd.Series(True, index=df.index)
-    if col_desc in df.columns:
-        mask &= df[col_desc].notna()
-    if col_num in df.columns:
-        mask &= df[col_num].notna()
+    if col_desc in df.columns: mask &= df[col_desc].notna()
+    if col_num in df.columns:  mask &= df[col_num].notna()
     return df[mask].copy()
 
 # ===================
@@ -177,8 +148,7 @@ DTYPES_82 = {'Order Number': 'Int64', 'Product Number': 'string', 'Product Descr
 
 def coerce_dtypes(df: pd.DataFrame, dmap: dict) -> pd.DataFrame:
     for _col, _dt in dmap.items():
-        if _col not in df.columns:
-            continue
+        if _col not in df.columns: continue
         try:
             if _dt in ('Int64', 'Float64'):
                 df[_col] = pd.to_numeric(df[_col], errors='coerce').astype(_dt)
@@ -210,7 +180,7 @@ def t_transform_header(df: pd.DataFrame) -> pd.DataFrame:
 
 @task(retries=2, retry_delay_seconds=5)
 def t_write_header(fs, df: pd.DataFrame, xls_name: str):
-    write_gdrive_excel_atomic(fs, xls_name, df, sheet_name="default_1", mode="w")
+    write_gdrive_excel_atomic(fs, xls_name, df, sheet_name="default_1")
     get_run_logger().info(f"Wrote Excel: {xls_name} (rows={len(df):,})")
 
 @task(retries=2, retry_delay_seconds=5)
@@ -232,7 +202,7 @@ def t_transform_detail(df: pd.DataFrame) -> pd.DataFrame:
 
 @task(retries=2, retry_delay_seconds=5)
 def t_write_detail(fs, df: pd.DataFrame, xls_name: str):
-    write_gdrive_excel_atomic(fs, xls_name, df, sheet_name="default_1", mode="w")
+    write_gdrive_excel_atomic(fs, xls_name, df, sheet_name="default_1")
     get_run_logger().info(f"Wrote Excel: {xls_name} (rows={len(df):,})")
 
 # ============
@@ -247,9 +217,9 @@ def pfs_sales_flow(
     xls_out_detail: str = XLS_OUT_DETAIL,
 ):
     logger = get_run_logger()
-    fs = make_fs(gdrive_root_id)  # ADC (no browser)
+    fs = make_fs(gdrive_root_id)  # ← service-account auth (no browser)
 
-    # Optional: list once to confirm access
+    # Optional: show folder contents once
     try:
         logger.info(f"Drive folder listing: {fs.ls('')}")
     except Exception as e:
