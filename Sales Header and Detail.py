@@ -1,17 +1,18 @@
 from pathlib import Path
 import pandas as pd
 import re as _re
-from gdrive_fsspec import GoogleDriveFileSystem
+import tempfile, os, json
 
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from datetime import timedelta
-import tempfile, os
+from prefect.blocks.system import Secret
+
+from gdrive_fsspec import GoogleDriveFileSystem
 
 # =========================
 # CONFIG — customize here
 # =========================
-
 GDRIVE_ROOT_ID = "17RMLol0SgHKMcbptSswdYFJjB0MeKCQH"  # your folder ID
 CSV_IN_HEADER  = "Dewer - Open SalesOrderHeader - 9-28-2025.csv"
 CSV_IN_DETAIL  = "Dewer - OpenSalesOrderDetail - 9-28-2025.csv"
@@ -21,9 +22,14 @@ XLS_OUT_DETAIL = "PFS - Open Sales Order Detail Draft - 10-7-2025.xlsx"
 # ==============
 # Drive helpers
 # ==============
-def make_fs() -> GoogleDriveFileSystem:
-    # First run may prompt OAuth if token cache is empty
-    return GoogleDriveFileSystem(token="cache", root_file_id=GDRIVE_ROOT_ID)
+def make_fs(gdrive_root_id: str) -> GoogleDriveFileSystem:
+    """
+    Build a GoogleDriveFileSystem using a service account JSON stored in a Prefect Secret block.
+    Secret block name: gdrive-service-account
+    """
+    sa_json = Secret.load("gdrive-service-account").get()
+    sa_creds = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
+    return GoogleDriveFileSystem(creds=sa_creds, root_file_id=gdrive_root_id)
 
 def gdrive_list(fs: GoogleDriveFileSystem):
     try:
@@ -38,58 +44,38 @@ def read_gdrive_csv(fs: GoogleDriveFileSystem, filename: str, **read_csv_kwargs)
 def write_gdrive_excel_atomic(fs, filename: str, df: pd.DataFrame,
                               sheet_name="default_1", mode="w"):
     """
-    Write Excel locally, then upload to Drive atomically.
-    This avoids SSL EOFs during long streaming writes.
+    Write Excel locally, then upload to Drive atomically (avoids SSL EOFs during streaming).
     """
-    # 1) Write to a local temp file
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp_path = tmp.name
-
     try:
         with pd.ExcelWriter(tmp_path, engine="openpyxl", mode="w") as xw:
             df.to_excel(xw, sheet_name=sheet_name, header=True, index=False, na_rep="")
-
-        # 2) Upload in one shot
         try:
-            fs.put(tmp_path, filename)        # modern fsspec
+            fs.put(tmp_path, filename)        # fsspec >= 2023
         except AttributeError:
             fs.put_file(tmp_path, filename)   # older fsspec fallback
-
     finally:
-        # 3) Clean up local temp
         try:
             os.remove(tmp_path)
         except OSError:
             pass
 
-
-
-
 # --- Resilient CSV reader that survives odd bytes like 0x9D ---
 def read_gdrive_csv_resilient(fs, filename: str, **base_kwargs) -> pd.DataFrame:
-    """
-    Try cp1252 first; if it fails due to undefined bytes (e.g., 0x9D),
-    retry with cp1252 + replacement, then latin-1 as a last resort.
-    """
-    # Never stream in "chunksize" here; we want a single pass for reliability.
     attempts = [
         dict(encoding="cp1252", encoding_errors="strict"),
-        dict(encoding="cp1252", encoding_errors="replace"),  # inserts � for bad bytes
-        dict(encoding="latin-1", encoding_errors="strict"),  # decodes all bytes 0x00..0xFF
+        dict(encoding="cp1252", encoding_errors="replace"),
+        dict(encoding="latin-1", encoding_errors="strict"),
     ]
-
     last_err = None
-    for i, enc_kw in enumerate(attempts, 1):
+    for enc_kw in attempts:
         try:
             with fs.open(filename, "rb") as f:
                 return pd.read_csv(f, **base_kwargs, **enc_kw)
         except UnicodeDecodeError as e:
             last_err = e
-            # Try next encoding strategy
-    # If we somehow got here, re-raise the last error
     raise last_err
-
-
 
 # =================
 # KNIME-ish shims
@@ -112,11 +98,9 @@ def _rf_resolve(df: pd.DataFrame, name: str | None) -> str | None:
     return nmap.get(_rf_norm_name(name))
 
 def row_filter_78(df: pd.DataFrame) -> pd.DataFrame:
-    # KNIME node 78 – Your “Complete Order Status” rule was neutral; keep rows unchanged.
     return df.copy()
 
 def row_filter_83(df: pd.DataFrame) -> pd.DataFrame:
-    # Keep rows where Product Description and Product Number are both present
     col_desc = _rf_resolve(df, 'Product Description')
     col_num  = _rf_resolve(df, 'Product Number')
     mask = pd.Series(True, index=df.index)
@@ -191,10 +175,8 @@ def t_read_header(fs, csv_name: str) -> pd.DataFrame:
     df = read_gdrive_csv_resilient(
         fs, csv_name,
         sep=",", quotechar='"', header=0,
-        # keep your parsing options:
         na_values=["", " "], keep_default_na=True, skipinitialspace=True,
         low_memory=False,
-        # let the resilient reader decide encoding
     )
     df = coerce_dtypes(df, DTYPES_74)
     logger.info(f"[header] loaded {len(df):,} rows from {csv_name}")
@@ -202,9 +184,7 @@ def t_read_header(fs, csv_name: str) -> pd.DataFrame:
 
 @task
 def t_transform_header(df: pd.DataFrame) -> pd.DataFrame:
-    df1 = column_filter(df)
-    df2 = row_filter_78(df1)
-    return df2
+    return row_filter_78(column_filter(df))
 
 @task(retries=2, retry_delay_seconds=5)
 def t_write_header(fs, df: pd.DataFrame, xls_name: str):
@@ -226,9 +206,7 @@ def t_read_detail(fs, csv_name: str) -> pd.DataFrame:
 
 @task
 def t_transform_detail(df: pd.DataFrame) -> pd.DataFrame:
-    # Equivalent to: (ref sorter passthrough) -> row filter 83 -> (date passthrough)
     return row_filter_83(df)
-
 
 @task(retries=2, retry_delay_seconds=5)
 def t_write_detail(fs, df: pd.DataFrame, xls_name: str):
@@ -247,9 +225,10 @@ def pfs_sales_flow(
     xls_out_detail: str = XLS_OUT_DETAIL,
 ):
     logger = get_run_logger()
-    fs = GoogleDriveFileSystem(token="cache", root_file_id=gdrive_root_id)
+    # ✅ SERVICE ACCOUNT (no browser)
+    fs = make_fs(gdrive_root_id)
 
-    # (Optional) show folder contents once
+    # Optional: show folder contents once
     try:
         logger.info(f"Drive folder listing: {fs.ls('')}")
     except Exception as e:
@@ -268,5 +247,4 @@ def pfs_sales_flow(
     logger.info("Flow completed ✅")
 
 if __name__ == "__main__":
-    # Ad-hoc local run
     pfs_sales_flow()
