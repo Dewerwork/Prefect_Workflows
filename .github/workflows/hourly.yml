@@ -1,0 +1,55 @@
+name: Hourly Hot-Category Digest
+
+# Section 13: hot categories can move faster than a daily batch. This runs the
+# "hot" profile every hour; it shares the seen-store with the daily run, so an
+# item surfaced here is not re-reported in the daily digest.
+on:
+  schedule:
+    - cron: "15 * * * *"    # every hour at :15
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without sending email or writing state"
+        type: boolean
+        default: false
+
+concurrency:
+  group: marketplace-monitor       # serialize with the daily run (shared store)
+  cancel-in-progress: false
+
+jobs:
+  hot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run hot-category digest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          STORE_URL: ${{ secrets.STORE_URL }}
+          STORE_AUTH_TOKEN: ${{ secrets.STORE_AUTH_TOKEN }}
+          PYTHONPATH: src
+        run: |
+          python -m marketplace_monitor.run --profile hot \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}

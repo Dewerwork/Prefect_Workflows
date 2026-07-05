@@ -1,0 +1,74 @@
+name: Daily Marketplace Digest
+
+# Section 10.1: free at this scale, secrets built in, trivial to trigger by hand.
+on:
+  schedule:
+    # 07:00 America/Boise (MDT = UTC-6) -> 13:00 UTC. Adjust for your timezone.
+    - cron: "0 13 * * *"
+  workflow_dispatch:      # allow manual runs for testing
+    inputs:
+      dry_run:
+        description: "Run without sending email or writing state"
+        type: boolean
+        default: false
+
+concurrency:
+  group: marketplace-monitor
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Pre-flight config + credential check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          PYTHONPATH: src
+        run: python -m marketplace_monitor.run --check
+
+      - name: Run daily digest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # State persistence (section 10.3): use Turso for a durable seen-store.
+          STORE_URL: ${{ secrets.STORE_URL }}
+          STORE_AUTH_TOKEN: ${{ secrets.STORE_AUTH_TOKEN }}
+          PYTHONPATH: src
+        run: |
+          python -m marketplace_monitor.run \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log
+          path: data/last_run.json
+          if-no-files-found: ignore
+          retention-days: 14
