@@ -76,7 +76,7 @@ delivery:
 marketplaces:
   # --- P0: free and easy -----------------------------------------------------
   - name: ebay
-    enabled: true
+    enabled: false            # disabled — no eBay API keys configured
     options:
       limit: 50
       local_pickup_only: true
@@ -121,13 +121,19 @@ marketplaces:
       - query: "pressure canner"
         category: "Homestead"
 
-  # --- P2: second wave / own phase (disabled by default) --------------------
+  # --- P2: via Apify actors (need APIFY_TOKEN + an actor id) -----------------
+  # Each actor has its OWN input field names. If a source returns 0 results,
+  # open the actor's "Input" tab on apify.com, copy its example input, and add
+  # the right keys under options.extra_input below (merged into the run input).
   - name: offerup
-    enabled: false
+    enabled: true
     options:
       mode: "apify"            # apify | internal
-      apify_actor: ""          # e.g. "someuser/offerup-scraper"
+      # VERIFY on apify.com/store before running (maintenance + pricing).
+      # Candidates: lulzasaur/offerup-scraper, igolaizola/offerup-scraper
+      apify_actor: "lulzasaur/offerup-scraper"
       max_items: 40
+      extra_input: {}          # actor-specific input keys, e.g. {keywords: "..."}
     searches:
       - query: "cast iron"
         category: "Home & Garden"
@@ -135,11 +141,14 @@ marketplaces:
         category: "Miniatures"
 
   - name: facebook
-    enabled: false             # the only source that costs real money
+    enabled: true              # NOTE: costs money per result (see below)
     options:
-      apify_actor: ""          # e.g. "someuser/facebook-marketplace-scraper"
+      # Official, maintained Apify actor (no login, public data).
+      # Alternatives: curious_coder/facebook-marketplace, thirdwatch/...
+      apify_actor: "apify/facebook-marketplace-scraper"
       max_items: 30
       max_searches: 3          # hard cap to bound per-result spend
+      extra_input: {}          # actor-specific input keys go here
     searches:
       - query: "cast iron cookware"
         category: "Home & Garden"

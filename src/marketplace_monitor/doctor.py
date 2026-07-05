@@ -52,6 +52,14 @@ def run_checks(cfg: Config) -> list[Check]:
         needed = cls.required_env(mc.options)
         ok, missing = _env_present(needed)
         n_searches = len(mc.searches)
+        # Apify-backed sources also need an actor id to do anything.
+        uses_apify = "APIFY_TOKEN" in needed
+        if uses_apify and not mc.options.get("apify_actor"):
+            checks.append(
+                Check(WARN, f"marketplace:{mc.name}",
+                      "enabled but no apify_actor set (adapter will return nothing)")
+            )
+            continue
         if not n_searches:
             checks.append(Check(WARN, f"marketplace:{mc.name}", "enabled but no searches configured"))
         elif ok:

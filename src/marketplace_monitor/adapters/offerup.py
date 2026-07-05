@@ -63,6 +63,9 @@ class OfferUpAdapter(BaseAdapter):
         }
         if spec.max_price is not None:
             run_input["priceMax"] = spec.max_price
+        # Escape hatch: merge actor-specific input fields from config so any
+        # actor's schema can be matched without editing this adapter.
+        run_input.update(self.options.get("extra_input", {}))
         items = run_apify_actor(self.actor, run_input)
         return [self._to_raw(item, spec) for item in items if item]
 
