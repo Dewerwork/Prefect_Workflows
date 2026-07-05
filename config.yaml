@@ -1,0 +1,121 @@
+# Local Marketplace Monitor — single config file (FR-9).
+# Everything the pipeline needs: location, marketplaces + searches, the
+# deterministic pre-filter, LLM scoring thresholds, and delivery.
+# Secrets are referenced with ${ENV_VAR} and never live in this file.
+
+location:
+  label: "Caldwell, ID"
+  zip_code: "83605"
+  radius_mi: 40          # covers Boise / Nampa / Meridian
+  # Optional lat/long if an adapter wants exact coordinates.
+  latitude: 43.6629
+  longitude: -116.6874
+
+# Deterministic pre-filter (section 6.2) — kills cheap noise before any LLM call.
+prefilter:
+  max_price: 300               # global ceiling when a search sets none
+  max_distance_mi: 40          # defaults to location.radius_mi
+  exclude_keywords:            # hard excludes on title + description
+    - "wanted"
+    - "trade only"
+    - "scam"
+  exclude_categories: []
+
+# LLM scoring (section 8) — Claude Haiku, prompt-cached, micro-batched.
+scoring:
+  model: "claude-haiku-4-5"
+  threshold: 60                # digest keeps score >= threshold
+  max_results: 40              # cap digest length
+  batch_size: 8                # listings per LLM request
+  use_batch_api: false         # set true for ~50% off on the daily run
+  preferences_path: "preferences.md"
+
+# Delivery (section 9.2). method: console | smtp | resend
+delivery:
+  method: "console"            # switch to "resend" or "smtp" once configured
+  to:
+    - "you@example.com"
+  from: "Marketplace Monitor <monitor@example.com>"
+  subject_prefix: "Marketplace Monitor"
+  send_when_empty: true
+  group_by: "category"         # category | source | none
+  # SMTP settings (only used when method: smtp). Use env vars for secrets.
+  smtp_host: "${SMTP_HOST}"
+  smtp_port: 587
+  smtp_user: "${SMTP_USER}"
+  smtp_password: "${SMTP_PASSWORD}"
+
+# Marketplaces (section 5). Each is an isolated adapter — disabling one, or a
+# broken one at runtime, never affects the others (FR-10).
+marketplaces:
+  # --- P0: free and easy -----------------------------------------------------
+  - name: ebay
+    enabled: true
+    options:
+      limit: 50
+      local_pickup_only: true
+    searches:
+      - query: "lodge cast iron"
+        max_price: 40
+        category: "Home & Garden"
+      - query: "warhammer 40k lot"
+        category: "Miniatures"
+      - query: "pressure canner"
+        category: "Homestead"
+
+  - name: craigslist
+    enabled: true
+    options:
+      site: "boise"            # -> boise.craigslist.org
+      section: "sss"           # all for-sale
+    searches:
+      - query: "cast iron"
+        max_price: 40
+        category: "Home & Garden"
+      - query: "warhammer miniatures"
+        category: "Miniatures"
+      - query: "canning jars"
+        category: "Homestead"
+      - query: "table saw"
+        category: "Tools"
+
+  # --- P1: high regional value ----------------------------------------------
+  - name: ksl
+    enabled: true
+    options:
+      rate_limit_seconds: 2
+    searches:
+      - query: "cast iron"
+        max_price: 40
+        category: "Home & Garden"
+      - query: "miniatures warhammer"
+        category: "Miniatures"
+      - query: "pressure canner"
+        category: "Homestead"
+
+  # --- P2: second wave / own phase (disabled by default) --------------------
+  - name: offerup
+    enabled: false
+    options:
+      mode: "apify"            # apify | internal
+      apify_actor: ""          # e.g. "someuser/offerup-scraper"
+      max_items: 40
+    searches:
+      - query: "cast iron"
+        category: "Home & Garden"
+      - query: "warhammer"
+        category: "Miniatures"
+
+  - name: facebook
+    enabled: false             # the only source that costs real money
+    options:
+      apify_actor: ""          # e.g. "someuser/facebook-marketplace-scraper"
+      max_items: 30
+      max_searches: 3          # hard cap to bound per-result spend
+    searches:
+      - query: "cast iron cookware"
+        category: "Home & Garden"
+      - query: "warhammer 40k"
+        category: "Miniatures"
+      - query: "pressure canner"
+        category: "Homestead"

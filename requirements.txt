@@ -1,0 +1,9 @@
+# Core runtime dependencies for the Local Marketplace Monitor.
+anthropic>=0.49            # Claude Haiku scorer (section 8)
+requests>=2.31            # eBay Browse API, KSL HTTP, OfferUp, Apify, Resend
+feedparser>=6.0           # Craigslist RSS (section 5.2)
+PyYAML>=6.0               # config.yaml
+
+# Optional — only needed for specific backends:
+# libsql-experimental>=0.0.37   # Turso/libSQL seen-store in CI (section 10.3)
+# prefect>=3.0                  # run the pipeline as a Prefect flow (flow.py)
