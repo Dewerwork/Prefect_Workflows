@@ -58,6 +58,7 @@ Nothing else changes.
 
 ```bash
 pip install -r requirements.txt
+pip install -e .              # so `python -m marketplace_monitor.run` resolves
 cp .env.example .env          # fill in ANTHROPIC_API_KEY and any source keys
 
 # Edit what you're looking for (prose, not keywords):

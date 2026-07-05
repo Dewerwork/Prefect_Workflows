@@ -66,7 +66,17 @@ class CraigslistAdapter(BaseAdapter):
         import feedparser  # lazy: keeps the package importable without the dep
 
         url = self._build_url(spec)
-        feed = feedparser.parse(url)
+        # Craigslist blocks default feed-reader user agents; present as a browser.
+        feed = feedparser.parse(url, agent=_UA)
+        status = getattr(feed, "status", None)
+        logger.debug(
+            "[craigslist] GET %s -> status=%s bozo=%s entries=%d",
+            url, status, getattr(feed, "bozo", None), len(feed.entries),
+        )
+        if getattr(feed, "bozo", 0) and getattr(feed, "bozo_exception", None):
+            logger.debug("[craigslist] parse note: %s", feed.bozo_exception)
+        if not feed.entries:
+            logger.info("[craigslist] 0 entries (status=%s) for %s", status, url)
         out: list[RawListing] = []
         for entry in feed.entries:
             link = entry.get("link", "")

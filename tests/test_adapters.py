@@ -8,9 +8,11 @@ from marketplace_monitor.config import LocationConfig
 
 
 class FakeResponse:
-    def __init__(self, json_data=None, text=""):
+    def __init__(self, json_data=None, text="", url="https://example.test/", status_code=200):
         self._json = json_data
         self.text = text
+        self.url = url
+        self.status_code = status_code
 
     def raise_for_status(self):
         pass
@@ -84,7 +86,7 @@ def test_craigslist_parses_rss(monkeypatch):
             }
         ]
     )
-    fake_module = types.SimpleNamespace(parse=lambda url: fake_feed)
+    fake_module = types.SimpleNamespace(parse=lambda url, **kw: fake_feed)
     monkeypatch.setitem(__import__("sys").modules, "feedparser", fake_module)
 
     adapter = craigslist.CraigslistAdapter(location=LOC, options={"site": "boise"})

@@ -32,6 +32,16 @@ from .store import SeenStore
 logger = logging.getLogger(__name__)
 
 
+def _load_dotenv() -> None:
+    """Best-effort: load a local .env so keys work without exporting them.
+    No-op if python-dotenv isn't installed or there's no .env file."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv()
+
+
 def select_marketplaces(cfg: Config, profile: ProfileConfig | None, only_source: str | None):
     """Narrow the run to a profile's marketplaces + categories and/or a single
     source. Returns filtered ``MarketplaceConfig`` copies (searches trimmed to
@@ -64,8 +74,13 @@ def run(
     only_source: str | None = None,
     profile: str | None = None,
 ) -> RunSummary:
+    _load_dotenv()
     cfg = load_config(config_path)
-    logging.getLogger("marketplace_monitor").setLevel(logging.INFO)
+    # Default to INFO for programmatic callers, but don't stomp an explicit
+    # level (e.g. DEBUG set by --verbose in main()).
+    pkg_logger = logging.getLogger("marketplace_monitor")
+    if pkg_logger.level == logging.NOTSET:
+        pkg_logger.setLevel(logging.INFO)
     summary = RunSummary()
 
     profile_cfg = cfg.get_profile(profile) if profile else None
@@ -219,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Set the package logger explicitly so --verbose reaches the adapter debug logs.
+    logging.getLogger("marketplace_monitor").setLevel(
+        logging.DEBUG if args.verbose else logging.INFO
+    )
+    _load_dotenv()
 
     if args.list_sources:
         print("registered marketplaces:", ", ".join(available()))
