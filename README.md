@@ -27,10 +27,12 @@ schedule ─▶ orchestrator ─▶ adapters ─▶ normalize ─▶ dedupe ─�
    is reported once (title + price similarity).
 5. **Pre-filter** deterministically (price ceiling, distance, hard excludes) —
    this kills 70–90% of noise for free, *before* any LLM call.
-6. **Score** each survivor 0–100 against your `preferences.md` with Claude Haiku,
+6. **Enrich** (optional) survivors that lack a description — e.g. a light
+   follow-up fetch of a Craigslist listing body, opt-in and capped.
+7. **Score** each survivor 0–100 against your `preferences.md` with Claude Haiku,
    with a one-sentence rationale.
-7. **Rank**, drop anything below threshold, cap the digest length.
-8. **Render + send** an HTML email, optionally **ping** for standout items, then
+8. **Rank**, drop anything below threshold, cap the digest length.
+9. **Render + send** an HTML email, optionally **ping** for standout items, then
    update the seen-store and write a structured run log.
 
 The design philosophy: *cheap and boring beats clever and fragile.* Official
@@ -68,6 +70,10 @@ python -m marketplace_monitor.run --dry-run
 
 # Real run (delivers per config.yaml, updates the seen-store):
 python -m marketplace_monitor.run
+
+# Validate config + credential readiness before a real run (exits non-zero on
+# a fatal problem — handy as a CI/cron pre-flight):
+python -m marketplace_monitor.run --check
 
 # Run a single marketplace (handy for testing one adapter):
 python -m marketplace_monitor.run --source ebay --dry-run
@@ -173,6 +179,7 @@ src/marketplace_monitor/
   report.py                  # HTML + text digest
   deliver.py                 # console / SMTP / Resend
   notify.py                  # instant alerts (Telegram / Discord)
+  doctor.py                  # --check config + credential readiness
   run.py                     # orchestrator
 flow.py                      # optional Prefect flow wrapper
 .github/workflows/daily.yml  # scheduled run + secrets

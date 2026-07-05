@@ -32,6 +32,10 @@ _SCOPE = "https://api.ebay.com/oauth/api_scope"
 class EbayAdapter(BaseAdapter):
     name = "ebay"
 
+    @classmethod
+    def required_env(cls, options=None):
+        return ["EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET"]
+
     def __init__(self, *, location=None, options=None):
         super().__init__(location=location, options=options)
         self._token: str | None = None

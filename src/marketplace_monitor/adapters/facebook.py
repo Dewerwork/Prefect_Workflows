@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 class FacebookAdapter(BaseAdapter):
     name = "facebook"
 
+    @classmethod
+    def required_env(cls, options=None):
+        # FB always goes through a paid Apify actor.
+        return ["APIFY_TOKEN"]
+
     def __init__(self, *, location=None, options=None):
         super().__init__(location=location, options=options)
         self.actor = self.options.get("apify_actor", "")

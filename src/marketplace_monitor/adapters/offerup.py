@@ -32,6 +32,12 @@ _INTERNAL_URL = "https://offerup.com/api/graphql"
 class OfferUpAdapter(BaseAdapter):
     name = "offerup"
 
+    @classmethod
+    def required_env(cls, options=None):
+        options = options or {}
+        mode = options.get("mode") or ("apify" if os.environ.get("APIFY_TOKEN") else "internal")
+        return ["APIFY_TOKEN"] if mode == "apify" else []
+
     def __init__(self, *, location=None, options=None):
         super().__init__(location=location, options=options)
         self.mode = self.options.get("mode")

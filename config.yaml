@@ -84,6 +84,8 @@ marketplaces:
     options:
       site: "boise"            # -> boise.craigslist.org
       section: "sss"           # all for-sale
+      fetch_body: false        # opt-in: fetch listing bodies for borderline items
+      max_body_fetches: 20     # cap page fetches per run when fetch_body is on
     searches:
       - query: "cast iron"
         max_price: 40

@@ -29,6 +29,11 @@ class MarketplaceAdapter(Protocol):
         own boundary — on failure, log and return []."""
         ...
 
+    def enrich(self, listings: list) -> None:
+        """Optionally fill in missing fields (e.g. a description) in place, for
+        borderline listings that survived the pre-filter. No-op by default."""
+        ...
+
 
 class BaseAdapter:
     """Convenience base that provides the never-raise guarantee.
@@ -44,8 +49,19 @@ class BaseAdapter:
         self.location = location
         self.options = options or {}
 
+    @classmethod
+    def required_env(cls, options: dict | None = None) -> list[str]:
+        """Environment variables this adapter needs to function, given its
+        config options. Used by the ``--check`` doctor. Default: none."""
+        return []
+
     def _fetch(self, spec: SearchSpec) -> list[RawListing]:  # pragma: no cover - abstract
         raise NotImplementedError
+
+    def enrich(self, listings: list) -> None:
+        """Default: no enrichment. Adapters that can cheaply fetch fuller detail
+        (e.g. Craigslist listing bodies) override this."""
+        return None
 
     def fetch(self, queries: list[SearchSpec]) -> list[RawListing]:
         results: list[RawListing] = []

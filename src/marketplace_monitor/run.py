@@ -49,6 +49,7 @@ def run(
 
     # 1. Fetch from every enabled marketplace (isolated per adapter).
     raw_listings = []
+    adapters_by_name = {}
     for mc in marketplaces:
         try:
             adapter = build_adapter(mc.name, location=cfg.location, options=mc.options)
@@ -56,6 +57,7 @@ def run(
             logger.warning("could not build adapter '%s': %s", mc.name, exc)
             summary.adapter_errors.append(f"{mc.name}: {exc}")
             continue
+        adapters_by_name[mc.name] = adapter
         found = adapter.fetch(mc.searches)
         summary.fetched_by_source[mc.name] = len(found)
         raw_listings.extend(found)
@@ -79,6 +81,10 @@ def run(
         # 5. Deterministic pre-filter (kill cheap noise before any LLM call).
         survivors, _pf_stats = prefilter_apply(deduped, cfg.prefilter)
         summary.after_prefilter = len(survivors)
+
+        # 5b. Optional enrichment: let adapters fill in missing detail (e.g. a
+        #     Craigslist listing body) for survivors before scoring (section 5.2).
+        _enrich(survivors, adapters_by_name)
 
         # 6. LLM scoring (only survivors get scored).
         scorer = Scorer(cfg.scoring)
@@ -124,6 +130,21 @@ def run(
     return summary
 
 
+def _enrich(survivors: list, adapters_by_name: dict) -> None:
+    """Ask each source's adapter to enrich its own survivors (best-effort)."""
+    by_source: dict[str, list] = {}
+    for listing in survivors:
+        by_source.setdefault(listing.source, []).append(listing)
+    for source, items in by_source.items():
+        adapter = adapters_by_name.get(source)
+        if adapter is None:
+            continue
+        try:
+            adapter.enrich(items)
+        except Exception as exc:  # noqa: BLE001 - enrichment is optional
+            logger.info("enrichment for '%s' failed: %s", source, exc)
+
+
 def _write_run_log(path: str | None, summary: RunSummary, dry_run: bool) -> None:
     if not path or dry_run:
         return
@@ -145,6 +166,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--list-sources", action="store_true", help="list registered marketplaces and exit"
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="validate config + credential readiness and exit (no fetching)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -156,6 +182,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_sources:
         print("registered marketplaces:", ", ".join(available()))
         return 0
+
+    if args.check:
+        from .doctor import format_checks, run_checks, worst_status
+
+        cfg = load_config(args.config)
+        checks = run_checks(cfg)
+        print(f"Config: {args.config or 'config.yaml'}")
+        print(format_checks(checks))
+        status = worst_status(checks)
+        print(f"\nResult: {status.upper()}")
+        return 1 if status == "fail" else 0
 
     run(args.config, dry_run=args.dry_run, only_source=args.source)
     return 0

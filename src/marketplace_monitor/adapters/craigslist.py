@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 _PRICE_RE = re.compile(r"\$([0-9][0-9,]*)")
 
 
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+)
+_BODY_RE = re.compile(r'id="postingbody"[^>]*>(.*?)</section>', re.DOTALL | re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
 class CraigslistAdapter(BaseAdapter):
     name = "craigslist"
 
@@ -32,6 +40,12 @@ class CraigslistAdapter(BaseAdapter):
         self.site = self.options.get("site", "sfbay")
         # Default search section: 'sss' = all for sale.
         self.section = self.options.get("section", "sss")
+        # RSS gives no body text. Opt in to a light follow-up fetch of the
+        # listing page for borderline items that survived the pre-filter
+        # (section 5.2). Off by default; capped and rate-limited when on.
+        self.fetch_body = bool(self.options.get("fetch_body", False))
+        self.max_body_fetches = int(self.options.get("max_body_fetches", 20))
+        self.body_delay = float(self.options.get("body_delay_seconds", 1.0))
 
     def _build_url(self, spec: SearchSpec) -> str:
         section = spec.extra.get("section", self.section)
@@ -81,6 +95,50 @@ class CraigslistAdapter(BaseAdapter):
                 )
             )
         return out
+
+
+    def enrich(self, listings: list) -> None:
+        """Fetch listing-page bodies for items still missing a description.
+
+        Opt-in (``fetch_body: true``) and capped (``max_body_fetches``) to keep
+        volume/blocking risk low — the design's advice is to start RSS-only and
+        only reach for bodies on borderline items (section 5.2 / 14).
+        """
+        if not self.fetch_body:
+            return
+        import time
+
+        import requests
+
+        session = requests.Session()
+        session.headers.update({"User-Agent": _UA})
+        fetched = 0
+        for listing in listings:
+            if fetched >= self.max_body_fetches:
+                break
+            if listing.source != self.name or listing.description:
+                continue
+            try:
+                time.sleep(self.body_delay)
+                resp = session.get(listing.url, timeout=20)
+                resp.raise_for_status()
+                body = _extract_body(resp.text)
+                if body:
+                    listing.description = body
+                    fetched += 1
+            except Exception as exc:  # noqa: BLE001 - best-effort enrichment
+                logger.info("[craigslist] body fetch failed for %s: %s", listing.url, exc)
+        if fetched:
+            logger.info("[craigslist] enriched %d listing bodies", fetched)
+
+
+def _extract_body(html_text: str) -> str | None:
+    m = _BODY_RE.search(html_text)
+    if not m:
+        return None
+    text = _TAG_RE.sub(" ", m.group(1))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
 
 
 def requests_quote(text: str) -> str:
