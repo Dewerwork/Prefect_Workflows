@@ -129,11 +129,11 @@ marketplaces:
     enabled: true
     options:
       mode: "apify"            # apify | internal
-      # VERIFY on apify.com/store before running (maintenance + pricing).
-      # Candidates: lulzasaur/offerup-scraper, igolaizola/offerup-scraper
       apify_actor: "lulzasaur/offerup-scraper"
       max_items: 40
-      extra_input: {}          # actor-specific input keys, e.g. {keywords: "..."}
+      include_shipping: false  # local pickup focus
+      scrape_details: false    # true adds descriptions but costs more per result
+      extra_input: {}          # merged/overrides actor input if needed
     searches:
       - query: "cast iron"
         category: "Home & Garden"
@@ -144,11 +144,12 @@ marketplaces:
     enabled: true              # NOTE: costs money per result (see below)
     options:
       # Official, maintained Apify actor (no login, public data).
-      # Alternatives: curious_coder/facebook-marketplace, thirdwatch/...
       apify_actor: "apify/facebook-marketplace-scraper"
+      city_slug: "boise"       # FB Marketplace location in the search URL
       max_items: 30
       max_searches: 3          # hard cap to bound per-result spend
-      extra_input: {}          # actor-specific input keys go here
+      include_listing_details: false
+      extra_input: {}          # merged/overrides actor input if needed
     searches:
       - query: "cast iron cookware"
         category: "Home & Garden"

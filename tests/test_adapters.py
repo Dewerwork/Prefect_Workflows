@@ -144,15 +144,25 @@ def test_offerup_apify_mode(monkeypatch):
     from marketplace_monitor.adapters import offerup
     from marketplace_monitor.models import SearchSpec
 
+    captured = {}
     items = [{"id": "77", "title": "Cast iron griddle", "price": "25",
               "url": "https://offerup.com/item/detail/77", "locationName": "Boise"}]
-    monkeypatch.setattr(offerup, "run_apify_actor", lambda actor, run_input: items)
+
+    def fake_actor(actor, run_input):
+        captured["input"] = run_input
+        return items
+
+    monkeypatch.setattr(offerup, "run_apify_actor", fake_actor)
 
     adapter = offerup.OfferUpAdapter(
         location=LOC, options={"mode": "apify", "apify_actor": "u/actor"}
     )
     out = adapter.fetch([SearchSpec(query="cast iron")])
     assert len(out) == 1 and out[0].price == 25.0 and out[0].location == "Boise"
+    # Input must match the actor's real schema (location / radiusMiles keys).
+    assert captured["input"]["location"] == "83605"
+    assert captured["input"]["radiusMiles"] == 40
+    assert captured["input"]["query"] == "cast iron"
 
 
 def test_offerup_no_actor_returns_empty(monkeypatch):
@@ -171,17 +181,25 @@ def test_facebook_caps_searches(monkeypatch):
 
     calls = {"n": 0}
 
+    inputs = []
+
     def fake_actor(actor, run_input):
         calls["n"] += 1
+        inputs.append(run_input)
         return [{"id": "1", "title": "cast iron", "price": {"amount": 30},
                  "url": "https://fb.com/marketplace/item/1"}]
 
     monkeypatch.setattr(facebook, "run_apify_actor", fake_actor)
     adapter = facebook.FacebookAdapter(
-        location=LOC, options={"apify_actor": "u/a", "max_searches": 2}
+        location=LOC,
+        options={"apify_actor": "u/a", "max_searches": 2, "city_slug": "boise"},
     )
-    specs = [SearchSpec(query=f"q{i}") for i in range(5)]
+    specs = [SearchSpec(query="cast iron", max_price=40)] + [SearchSpec(query=f"q{i}") for i in range(4)]
     out = adapter.fetch(specs)
     # Hard cap: only 2 of the 5 searches actually hit the paid actor.
     assert calls["n"] == 2
     assert len(out) == 2
+    # Input must match the actor's real schema (startUrls / resultsLimit).
+    url = inputs[0]["startUrls"][0]["url"]
+    assert "marketplace/boise/search" in url and "query=cast+iron" in url and "maxPrice=40" in url
+    assert inputs[0]["resultsLimit"] == 30

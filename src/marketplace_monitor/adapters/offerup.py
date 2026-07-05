@@ -55,16 +55,18 @@ class OfferUpAdapter(BaseAdapter):
         if not self.actor:
             logger.info("[offerup] no apify_actor configured; skipping")
             return []
+        # Input shape for lulzasaur/offerup-scraper (verified schema):
+        #   query, location (zip), radiusMiles, maxItems, includeShipping,
+        #   scrapeDetails. No price filter — that stays in the pre-filter.
         run_input = {
             "query": spec.query,
-            "zipCode": getattr(self.location, "zip_code", None),
-            "radius": getattr(self.location, "radius_mi", None),
+            "location": getattr(self.location, "zip_code", None),
+            "radiusMiles": getattr(self.location, "radius_mi", None),
             "maxItems": self.max_items,
+            "includeShipping": bool(self.options.get("include_shipping", False)),
+            "scrapeDetails": bool(self.options.get("scrape_details", False)),
         }
-        if spec.max_price is not None:
-            run_input["priceMax"] = spec.max_price
-        # Escape hatch: merge actor-specific input fields from config so any
-        # actor's schema can be matched without editing this adapter.
+        # Escape hatch: merge/override actor-specific input fields from config.
         run_input.update(self.options.get("extra_input", {}))
         items = run_apify_actor(self.actor, run_input)
         return [self._to_raw(item, spec) for item in items if item]

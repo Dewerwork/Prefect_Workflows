@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from urllib.parse import quote_plus
 
 from ..models import RawListing, SearchSpec
 from .apify import run_apify_actor
@@ -37,7 +38,21 @@ class FacebookAdapter(BaseAdapter):
         # Hard cap on how many of the configured searches FB will run, to bound
         # per-result spend regardless of how many searches are configured.
         self.max_searches = int(self.options.get("max_searches", 3))
+        # FB Marketplace URLs are keyed by a city slug (e.g. .../marketplace/boise/...).
+        self.city_slug = self.options.get("city_slug", "boise")
+        self.include_details = bool(self.options.get("include_listing_details", False))
         self._searches_run = 0
+
+    def _search_url(self, spec: SearchSpec) -> str:
+        url = (
+            f"https://www.facebook.com/marketplace/{self.city_slug}/search/"
+            f"?query={quote_plus(spec.query)}"
+        )
+        if spec.max_price is not None:
+            url += f"&maxPrice={int(spec.max_price)}"
+        if spec.min_price is not None:
+            url += f"&minPrice={int(spec.min_price)}"
+        return url
 
     def _fetch(self, spec: SearchSpec) -> list[RawListing]:
         if self._searches_run >= self.max_searches:
@@ -49,18 +64,14 @@ class FacebookAdapter(BaseAdapter):
             return []
         self._searches_run += 1
 
+        # Input shape for apify/facebook-marketplace-scraper (verified schema):
+        #   startUrls: [{url}], resultsLimit, includeListingDetails.
         run_input = {
-            "query": spec.query,
-            "city": getattr(self.location, "zip_code", None),
-            "radius": getattr(self.location, "radius_mi", None),
-            "maxItems": self.max_items,
+            "startUrls": [{"url": self._search_url(spec)}],
+            "resultsLimit": self.max_items,
+            "includeListingDetails": self.include_details,
         }
-        if spec.max_price is not None:
-            run_input["maxPrice"] = spec.max_price
-        if spec.min_price is not None:
-            run_input["minPrice"] = spec.min_price
-        # Escape hatch: merge actor-specific input fields from config so any
-        # actor's schema can be matched without editing this adapter.
+        # Escape hatch: merge/override actor-specific input fields from config.
         run_input.update(self.options.get("extra_input", {}))
 
         items = run_apify_actor(self.actor, run_input)
