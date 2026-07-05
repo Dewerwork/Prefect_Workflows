@@ -16,19 +16,22 @@ reason per item and a direct link.
 ## How it works
 
 ```
-schedule ─▶ orchestrator ─▶ adapters ─▶ normalize ─▶ dedupe ─▶ pre-filter ─▶ LLM scorer ─▶ rank+cap ─▶ email
- (cron/CI)                  (isolated)   (Listing)   (SQLite)  (free cuts)   (Claude Haiku)            (digest)
+schedule ─▶ orchestrator ─▶ adapters ─▶ normalize ─▶ dedupe ─▶ near-dup ─▶ pre-filter ─▶ LLM scorer ─▶ rank+cap ─▶ email
+ (cron/CI)                  (isolated)   (Listing)   (SQLite)  (collapse)  (free cuts)   (Claude Haiku)            + alerts
 ```
 
 1. **Fetch** new listings from each enabled marketplace (each an isolated adapter).
 2. **Normalize** every listing to one common schema.
 3. **Dedupe** against a seen-store so you never see the same item twice.
-4. **Pre-filter** deterministically (price ceiling, distance, hard excludes) —
+4. **Collapse near-dups** — the same item cross-posted to several marketplaces
+   is reported once (title + price similarity).
+5. **Pre-filter** deterministically (price ceiling, distance, hard excludes) —
    this kills 70–90% of noise for free, *before* any LLM call.
-5. **Score** each survivor 0–100 against your `preferences.md` with Claude Haiku,
+6. **Score** each survivor 0–100 against your `preferences.md` with Claude Haiku,
    with a one-sentence rationale.
-6. **Rank**, drop anything below threshold, cap the digest length.
-7. **Render + send** an HTML email, then update the seen-store.
+7. **Rank**, drop anything below threshold, cap the digest length.
+8. **Render + send** an HTML email, optionally **ping** for standout items, then
+   update the seen-store and write a structured run log.
 
 The design philosophy: *cheap and boring beats clever and fragile.* Official
 feeds/APIs are preferred over scraping; the LLM is a filter that only reads
@@ -65,6 +68,12 @@ python -m marketplace_monitor.run --dry-run
 
 # Real run (delivers per config.yaml, updates the seen-store):
 python -m marketplace_monitor.run
+
+# Run a single marketplace (handy for testing one adapter):
+python -m marketplace_monitor.run --source ebay --dry-run
+
+# List registered marketplaces:
+python -m marketplace_monitor.run --list-sources
 ```
 
 With no email configured, `delivery.method: console` just prints the digest —
@@ -95,6 +104,22 @@ locally or GitHub Actions Secrets in CI — they never live in the repo.
 | CI state store | `STORE_URL`, `STORE_AUTH_TOKEN` | Turso seen-store in CI |
 
 Craigslist and KSL need no credentials.
+
+## Instant alerts (optional)
+
+Between daily digests, the monitor can ping you the moment a standout item shows
+up. Set `alerts.enabled: true` in `config.yaml`, pick a `channel` (`telegram` or
+`discord`) and a `min_score` (default 90), and provide the channel's credentials
+(`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`, or `DISCORD_WEBHOOK_URL`). Alerts are
+best-effort — a failed ping is logged and never affects the digest.
+
+## Observability
+
+Each run writes a structured JSON log to `run_log_path` (default
+`data/last_run.json`) with the funnel counts per stage — fetched per source,
+new after dedupe, near-dups collapsed, survivors after pre-filter, scored,
+reported, alerts sent, and any adapter errors. The GitHub Actions workflow
+uploads it as a build artifact so you can see coverage at a glance.
 
 ## Scheduling
 
@@ -127,9 +152,10 @@ pip install -r requirements.txt pytest
 python -m pytest          # pure-pipeline tests: no network, no API key
 ```
 
-The tests cover normalization, dedupe/idempotency, the deterministic pre-filter,
-scorer parsing (with a fake LLM client), report rendering, and the adapter
-never-raise-past-its-boundary guarantee.
+The tests cover normalization, dedupe/idempotency, cross-marketplace near-dup
+collapse, the deterministic pre-filter, scorer parsing (with a fake LLM client),
+per-adapter parsing (network monkeypatched), report rendering, instant alerts,
+the adapter never-raise-past-its-boundary guarantee, and a full orchestrator run.
 
 ## Repo layout
 
@@ -141,10 +167,12 @@ src/marketplace_monitor/
   models.py                  # Listing / RawListing / ScoredListing / SearchSpec
   normalize.py               # raw -> Listing
   store.py                   # seen-store (SQLite / Turso), dedupe, idempotency
+  dedupe.py                  # cross-marketplace near-dup collapse
   prefilter.py               # deterministic cuts
   score.py                   # Claude Haiku scorer (prompt cache + batch)
   report.py                  # HTML + text digest
   deliver.py                 # console / SMTP / Resend
+  notify.py                  # instant alerts (Telegram / Discord)
   run.py                     # orchestrator
 flow.py                      # optional Prefect flow wrapper
 .github/workflows/daily.yml  # scheduled run + secrets

@@ -13,7 +13,9 @@ from pathlib import Path
 
 import yaml
 
+from .dedupe import DedupeConfig
 from .models import SearchSpec
+from .notify import AlertsConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -76,6 +78,9 @@ class Config:
     prefilter: PrefilterConfig
     scoring: ScoringConfig
     delivery: DeliveryConfig
+    dedupe: DedupeConfig
+    alerts: AlertsConfig
+    run_log_path: str | None = None
     raw: dict = field(default_factory=dict)
 
     def enabled_marketplaces(self) -> list[MarketplaceConfig]:
@@ -158,6 +163,20 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         smtp_password=dv.get("smtp_password"),
     )
 
+    dd = data.get("dedupe", {})
+    dedupe = DedupeConfig(
+        enabled=bool(dd.get("enabled", True)),
+        title_similarity=float(dd.get("title_similarity", 0.6)),
+        price_tolerance=float(dd.get("price_tolerance", 0.15)),
+    )
+
+    al = data.get("alerts", {})
+    alerts = AlertsConfig(
+        enabled=bool(al.get("enabled", False)),
+        channel=al.get("channel", "telegram"),
+        min_score=int(al.get("min_score", 90)),
+    )
+
     default_max = prefilter.max_price
     marketplaces: list[MarketplaceConfig] = []
     for m in data.get("marketplaces", []):
@@ -176,5 +195,8 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         prefilter=prefilter,
         scoring=scoring,
         delivery=delivery,
+        dedupe=dedupe,
+        alerts=alerts,
+        run_log_path=data.get("run_log_path"),
         raw=data,
     )

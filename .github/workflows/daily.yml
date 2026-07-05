@@ -43,6 +43,9 @@ jobs:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           # State persistence (section 10.3): use Turso for a durable seen-store.
           STORE_URL: ${{ secrets.STORE_URL }}
           STORE_AUTH_TOKEN: ${{ secrets.STORE_AUTH_TOKEN }}
@@ -50,3 +53,12 @@ jobs:
         run: |
           python -m marketplace_monitor.run \
             ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log
+          path: data/last_run.json
+          if-no-files-found: ignore
+          retention-days: 14

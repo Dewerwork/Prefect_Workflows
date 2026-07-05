@@ -20,11 +20,30 @@ class RunSummary:
     fetched_by_source: dict[str, int] = field(default_factory=dict)
     total_fetched: int = 0
     new_after_dedupe: int = 0
+    after_near_dup: int = 0
+    near_dups_collapsed: int = 0
     after_prefilter: int = 0
     scored: int = 0
     reported: int = 0
+    alerts_sent: int = 0
     adapter_errors: list[str] = field(default_factory=list)
     date: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
+
+    def to_dict(self) -> dict:
+        """Structured per-run log (NFR observability, section 4)."""
+        return {
+            "date": self.date,
+            "fetched_by_source": self.fetched_by_source,
+            "total_fetched": self.total_fetched,
+            "new_after_dedupe": self.new_after_dedupe,
+            "near_dups_collapsed": self.near_dups_collapsed,
+            "after_near_dup": self.after_near_dup,
+            "after_prefilter": self.after_prefilter,
+            "scored": self.scored,
+            "reported": self.reported,
+            "alerts_sent": self.alerts_sent,
+            "adapter_errors": self.adapter_errors,
+        }
 
 
 def _badge_color(score: int) -> str:
@@ -123,6 +142,12 @@ def _render_item(item: ScoredListing) -> str:
         f"<div style='color:#57606a;font-size:13px;margin-top:2px'>{html.escape(item.reason)}</div>"
         if item.reason else ""
     )
+    cross = l.raw.get("cross_posts") if isinstance(l.raw, dict) else None
+    if cross:
+        reason += (
+            f"<div style='color:#8250df;font-size:12px;margin-top:2px'>"
+            f"also cross-posted on {len(cross)} other marketplace(s)</div>"
+        )
     return (
         "<div style='display:flex;align-items:flex-start;padding:10px 0;"
         "border-bottom:1px solid #eaeef2'>"

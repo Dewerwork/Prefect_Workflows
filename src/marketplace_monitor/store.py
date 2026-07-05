@@ -96,6 +96,29 @@ class SeenStore:
             self.record(item.listing, score=item.score, reported=item.listing.id in reported_ids)
         self._conn.commit()
 
+    def record_run(
+        self,
+        listings: list[Listing],
+        scores_by_id: dict[str, int] | None = None,
+        reported_ids: set[str] | None = None,
+    ) -> None:
+        """Persist every listing we evaluated this run.
+
+        Recording pre-filtered and collapsed-away (cross-post) listings too —
+        not just the ones we scored — means nothing we've already looked at
+        resurfaces tomorrow as "new", so re-runs do no duplicate work (FR-3 /
+        idempotency).
+        """
+        scores_by_id = scores_by_id or {}
+        reported_ids = reported_ids or set()
+        for listing in listings:
+            self.record(
+                listing,
+                score=scores_by_id.get(listing.id),
+                reported=listing.id in reported_ids,
+            )
+        self._conn.commit()
+
     def close(self) -> None:
         try:
             self._conn.commit()

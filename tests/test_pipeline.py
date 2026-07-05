@@ -214,3 +214,74 @@ def test_adapter_one_bad_search_keeps_the_others():
     adapter = PartialAdapter()
     out = adapter.fetch([SearchSpec(query="bad"), SearchSpec(query="good")])
     assert len(out) == 1
+
+
+# --- full orchestrator integration -----------------------------------------
+
+def _write_integration_config(tmp_path):
+    prefs = tmp_path / "prefs.md"
+    prefs.write_text("# prefs\n- cast iron")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "location: {label: T, zip_code: '83605', radius_mi: 40}\n"
+        "prefilter: {max_price: 300}\n"
+        "dedupe: {enabled: true}\n"
+        "alerts: {enabled: false}\n"
+        f"run_log_path: '{tmp_path / 'run.json'}'\n"
+        f"scoring: {{model: m, threshold: 60, preferences_path: '{prefs}'}}\n"
+        "delivery: {method: console, send_when_empty: true}\n"
+        "marketplaces:\n  - {name: fake, enabled: true, searches: ['cast iron']}\n"
+    )
+    return str(cfg)
+
+
+class _FakeAdapter(BaseAdapter):
+    name = "fake"
+
+    def _fetch(self, spec):
+        # Same Dutch oven cross-posted on ebay + craigslist, plus a low-value item.
+        return [
+            RawListing(source="ebay", source_id="1", title="Lodge cast iron dutch oven",
+                       url="http://x/e1", price=35),
+            RawListing(source="craigslist", source_id="2", title="Lodge cast iron dutch oven",
+                       url="http://x/c2", price=35, description="nice"),
+            RawListing(source="ebay", source_id="3", title="rusty bolt",
+                       url="http://x/e3", price=1),
+        ]
+
+
+class _FakeScorer:
+    def __init__(self, cfg, client=None):
+        self.cfg = cfg
+
+    def score(self, listings):
+        # Dutch oven scores high; anything else low.
+        out = []
+        for l in listings:
+            score = 90 if "dutch oven" in l.title.lower() else 20
+            out.append(ScoredListing(listing=l, score=score, reason="r", matched_interest="cast iron"))
+        return out
+
+
+def test_full_run_collapses_dupes_and_is_idempotent(tmp_path, monkeypatch, capsys):
+    import marketplace_monitor.run as run_mod
+
+    config_path = _write_integration_config(tmp_path)
+    monkeypatch.setenv("STORE_URL", str(tmp_path / "seen.db"))
+    monkeypatch.setattr(run_mod, "build_adapter",
+                        lambda name, location=None, options=None: _FakeAdapter())
+    monkeypatch.setattr(run_mod, "Scorer", _FakeScorer)
+
+    summary = run_mod.run(config_path)
+    # 3 fetched -> 2 after cross-post collapse -> dutch oven reported once.
+    assert summary.total_fetched == 3
+    assert summary.new_after_dedupe == 3
+    assert summary.near_dups_collapsed == 1
+    assert summary.reported == 1
+    out = capsys.readouterr().out
+    assert "Lodge cast iron dutch oven" in out
+
+    # Idempotency: a second run sees everything as already-seen and reports nothing.
+    summary2 = run_mod.run(config_path)
+    assert summary2.new_after_dedupe == 0
+    assert summary2.reported == 0

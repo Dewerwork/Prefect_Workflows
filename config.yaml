@@ -21,6 +21,22 @@ prefilter:
     - "scam"
   exclude_categories: []
 
+# Cross-marketplace near-duplicate collapse (section 14). The same item is often
+# cross-posted to several marketplaces; this reports it once.
+dedupe:
+  enabled: true
+  title_similarity: 0.6        # Jaccard threshold on significant title tokens
+  price_tolerance: 0.15        # prices within 15% (or $5) count as the same item
+
+# Instant alerts between daily digests (section 9.2 / 13). Off by default.
+alerts:
+  enabled: false
+  channel: "telegram"          # telegram | discord
+  min_score: 90                # ping only for standout items
+
+# Structured per-run log for observability (section 4). Written after each run.
+run_log_path: "data/last_run.json"
+
 # LLM scoring (section 8) — Claude Haiku, prompt-cached, micro-batched.
 scoring:
   model: "claude-haiku-4-5"
