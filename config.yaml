@@ -37,6 +37,16 @@ alerts:
 # Structured per-run log for observability (section 4). Written after each run.
 run_log_path: "data/last_run.json"
 
+# Named profiles (section 13: per-category schedules). Run a tight "hot"
+# categories pass more often (hourly) and the full sweep once a day — both share
+# the seen-store, so nothing is reported twice. Select with --profile <name>.
+profiles:
+  hot:
+    categories: ["Miniatures"]   # only run searches tagged with these categories
+    threshold: 55                # be a little more eager on hot categories
+    max_results: 15
+    subject_prefix: "Hot deals"
+
 # LLM scoring (section 8) — Claude Haiku, prompt-cached, micro-batched.
 scoring:
   model: "claude-haiku-4-5"

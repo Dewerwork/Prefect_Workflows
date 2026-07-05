@@ -72,6 +72,24 @@ class MarketplaceConfig:
 
 
 @dataclass
+class ProfileConfig:
+    """A named subset of the run (section 13: per-category schedules).
+
+    A profile narrows which searches run (by category and/or marketplace) and
+    can override the threshold, digest cap, and subject line — so you can run a
+    tight "hot categories" pass hourly and the full sweep once a day, both
+    sharing one seen-store so nothing is reported twice.
+    """
+
+    name: str
+    categories: list[str] = field(default_factory=list)     # empty = all
+    marketplaces: list[str] = field(default_factory=list)    # empty = all enabled
+    threshold: int | None = None
+    max_results: int | None = None
+    subject_prefix: str | None = None
+
+
+@dataclass
 class Config:
     location: LocationConfig
     marketplaces: list[MarketplaceConfig]
@@ -80,11 +98,19 @@ class Config:
     delivery: DeliveryConfig
     dedupe: DedupeConfig
     alerts: AlertsConfig
+    profiles: dict[str, ProfileConfig] = field(default_factory=dict)
     run_log_path: str | None = None
     raw: dict = field(default_factory=dict)
 
     def enabled_marketplaces(self) -> list[MarketplaceConfig]:
         return [m for m in self.marketplaces if m.enabled]
+
+    def get_profile(self, name: str) -> ProfileConfig:
+        try:
+            return self.profiles[name]
+        except KeyError as exc:
+            known = ", ".join(self.profiles) or "(none defined)"
+            raise ValueError(f"unknown profile '{name}'; defined: {known}") from exc
 
 
 def _expand_env(value):
@@ -177,6 +203,18 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         min_score=int(al.get("min_score", 90)),
     )
 
+    profiles: dict[str, ProfileConfig] = {}
+    for name, p in (data.get("profiles", {}) or {}).items():
+        p = p or {}
+        profiles[name] = ProfileConfig(
+            name=name,
+            categories=p.get("categories", []) or [],
+            marketplaces=p.get("marketplaces", []) or [],
+            threshold=p.get("threshold"),
+            max_results=p.get("max_results"),
+            subject_prefix=p.get("subject_prefix"),
+        )
+
     default_max = prefilter.max_price
     marketplaces: list[MarketplaceConfig] = []
     for m in data.get("marketplaces", []):
@@ -197,6 +235,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         delivery=delivery,
         dedupe=dedupe,
         alerts=alerts,
+        profiles=profiles,
         run_log_path=data.get("run_log_path"),
         raw=data,
     )

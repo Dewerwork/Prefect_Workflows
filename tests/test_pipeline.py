@@ -285,3 +285,92 @@ def test_full_run_collapses_dupes_and_is_idempotent(tmp_path, monkeypatch, capsy
     summary2 = run_mod.run(config_path)
     assert summary2.new_after_dedupe == 0
     assert summary2.reported == 0
+
+
+# --- profiles ---------------------------------------------------------------
+
+def _cfg_with_profiles(tmp_path):
+    from marketplace_monitor.config import load_config
+
+    prefs = tmp_path / "prefs.md"
+    prefs.write_text("# prefs")
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "location: {label: T, zip_code: '83605', radius_mi: 40}\n"
+        "prefilter: {max_price: 300}\n"
+        f"scoring: {{model: m, threshold: 60, preferences_path: '{prefs}'}}\n"
+        "delivery: {method: console}\n"
+        "profiles:\n"
+        "  hot: {categories: ['Miniatures'], threshold: 55, subject_prefix: 'Hot deals'}\n"
+        "  ebay_only: {marketplaces: ['ebay']}\n"
+        "marketplaces:\n"
+        "  - name: ebay\n    enabled: true\n    searches:\n"
+        "      - {query: minis, category: Miniatures}\n"
+        "      - {query: skillet, category: Home & Garden}\n"
+        "  - name: craigslist\n    enabled: true\n    searches:\n"
+        "      - {query: minis, category: Miniatures}\n"
+    )
+    return load_config(cfg_path)
+
+
+def test_profile_filters_by_category(tmp_path):
+    from marketplace_monitor.run import select_marketplaces
+
+    cfg = _cfg_with_profiles(tmp_path)
+    selected = select_marketplaces(cfg, cfg.get_profile("hot"), None)
+    # Both marketplaces have a Miniatures search; the eBay Home & Garden one is dropped.
+    assert {m.name for m in selected} == {"ebay", "craigslist"}
+    ebay = next(m for m in selected if m.name == "ebay")
+    assert [s.query for s in ebay.searches] == ["minis"]
+
+
+def test_profile_filters_by_marketplace(tmp_path):
+    from marketplace_monitor.run import select_marketplaces
+
+    cfg = _cfg_with_profiles(tmp_path)
+    selected = select_marketplaces(cfg, cfg.get_profile("ebay_only"), None)
+    assert {m.name for m in selected} == {"ebay"}
+    # No category filter -> both eBay searches kept.
+    assert len(selected[0].searches) == 2
+
+
+def test_unknown_profile_raises(tmp_path):
+    cfg = _cfg_with_profiles(tmp_path)
+    with pytest.raises(ValueError):
+        cfg.get_profile("nope")
+
+
+def test_profile_threshold_override_applied(tmp_path, monkeypatch, capsys):
+    import marketplace_monitor.run as run_mod
+
+    cfg = _cfg_with_profiles(tmp_path)
+    # Point run() at the same config file the fixture wrote.
+    config_path = str(tmp_path / "config.yaml")
+    monkeypatch.setenv("STORE_URL", str(tmp_path / "seen.db"))
+
+    class _Adapter(BaseAdapter):
+        name = "ebay"
+
+        def _fetch(self, spec):
+            return [RawListing(source="ebay", source_id="1", title="mini lot",
+                               url="http://x/1", price=20)]
+
+    class _Scorer57:
+        def __init__(self, cfg, client=None):
+            pass
+
+        def score(self, listings):
+            return [ScoredListing(listing=l, score=57, reason="r") for l in listings]
+
+    monkeypatch.setattr(run_mod, "build_adapter",
+                        lambda name, location=None, options=None: _Adapter())
+    monkeypatch.setattr(run_mod, "Scorer", _Scorer57)
+
+    # Default threshold 60 -> a score of 57 is dropped.
+    s_default = run_mod.run(config_path, dry_run=True)
+    assert s_default.reported == 0
+    # Hot profile lowers threshold to 55 -> now it clears, and the console
+    # delivery (non-dry) shows the profile's subject prefix override.
+    s_hot = run_mod.run(config_path, profile="hot")
+    assert s_hot.reported == 1
+    assert "SUBJECT: Hot deals" in capsys.readouterr().out

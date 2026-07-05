@@ -13,12 +13,13 @@ evaluate is written to the seen-store.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 from pathlib import Path
 
 from .adapters import available, build_adapter
-from .config import load_config
+from .config import Config, ProfileConfig, load_config
 from .dedupe import collapse
 from .deliver import deliver
 from .normalize import normalize_all
@@ -31,21 +32,56 @@ from .store import SeenStore
 logger = logging.getLogger(__name__)
 
 
+def select_marketplaces(cfg: Config, profile: ProfileConfig | None, only_source: str | None):
+    """Narrow the run to a profile's marketplaces + categories and/or a single
+    source. Returns filtered ``MarketplaceConfig`` copies (searches trimmed to
+    the selected categories); marketplaces left with no searches are dropped.
+    """
+    marketplaces = cfg.enabled_marketplaces()
+
+    if profile and profile.marketplaces:
+        allow = set(profile.marketplaces)
+        marketplaces = [m for m in marketplaces if m.name in allow]
+    if only_source:
+        marketplaces = [m for m in marketplaces if m.name == only_source]
+
+    if profile and profile.categories:
+        cats = {c.lower() for c in profile.categories}
+        trimmed = []
+        for m in marketplaces:
+            searches = [s for s in m.searches if s.category and s.category.lower() in cats]
+            if searches:
+                trimmed.append(dataclasses.replace(m, searches=searches))
+        marketplaces = trimmed
+
+    return marketplaces
+
+
 def run(
     config_path: str | None = None,
     *,
     dry_run: bool = False,
     only_source: str | None = None,
+    profile: str | None = None,
 ) -> RunSummary:
     cfg = load_config(config_path)
     logging.getLogger("marketplace_monitor").setLevel(logging.INFO)
     summary = RunSummary()
 
-    marketplaces = cfg.enabled_marketplaces()
-    if only_source:
-        marketplaces = [m for m in marketplaces if m.name == only_source]
-        if not marketplaces:
-            logger.warning("source '%s' is not enabled in config", only_source)
+    profile_cfg = cfg.get_profile(profile) if profile else None
+    threshold = (profile_cfg.threshold if profile_cfg and profile_cfg.threshold is not None
+                 else cfg.scoring.threshold)
+    max_results = (profile_cfg.max_results if profile_cfg and profile_cfg.max_results is not None
+                   else cfg.scoring.max_results)
+    subject_prefix = (profile_cfg.subject_prefix if profile_cfg and profile_cfg.subject_prefix
+                      else cfg.delivery.subject_prefix)
+
+    marketplaces = select_marketplaces(cfg, profile_cfg, only_source)
+    if not marketplaces:
+        logger.warning("no marketplaces selected (profile=%s, source=%s)", profile, only_source)
+    if profile_cfg:
+        logger.info("profile '%s': %d marketplaces, threshold %d",
+                    profile, len(marketplaces), threshold)
 
     # 1. Fetch from every enabled marketplace (isolated per adapter).
     raw_listings = []
@@ -91,15 +127,15 @@ def run(
         scored = scorer.score(survivors) if survivors else []
         summary.scored = len(scored)
 
-        # 7. Rank, threshold, cap.
-        digest = rank_and_cap(scored, cfg.scoring.threshold, cfg.scoring.max_results)
+        # 7. Rank, threshold, cap (profile overrides applied).
+        digest = rank_and_cap(scored, threshold, max_results)
         summary.reported = len(digest)
 
         # 8. Render + deliver.
         html_body = render_html(digest, summary, cfg.delivery.group_by)
         text_body = render_text(digest, summary)
         if digest or cfg.delivery.send_when_empty:
-            subject = f"{cfg.delivery.subject_prefix}: {summary.reported} matches ({summary.date})"
+            subject = f"{subject_prefix}: {summary.reported} matches ({summary.date})"
             if dry_run:
                 print(text_body)
             else:
@@ -164,6 +200,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--source", help="run only this one marketplace (e.g. ebay)")
     parser.add_argument(
+        "--profile",
+        help="run a named profile from config (e.g. 'hot') — narrows categories "
+        "and applies its threshold/cap/subject overrides",
+    )
+    parser.add_argument(
         "--list-sources", action="store_true", help="list registered marketplaces and exit"
     )
     parser.add_argument(
@@ -194,7 +235,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nResult: {status.upper()}")
         return 1 if status == "fail" else 0
 
-    run(args.config, dry_run=args.dry_run, only_source=args.source)
+    try:
+        run(args.config, dry_run=args.dry_run, only_source=args.source, profile=args.profile)
+    except ValueError as exc:  # config-level problems (e.g. unknown profile)
+        parser.error(str(exc))
     return 0
 
 

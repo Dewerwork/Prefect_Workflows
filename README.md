@@ -127,11 +127,33 @@ new after dedupe, near-dups collapsed, survivors after pre-filter, scored,
 reported, alerts sent, and any adapter errors. The GitHub Actions workflow
 uploads it as a build artifact so you can see coverage at a glance.
 
+## Profiles (per-category schedules)
+
+Hot categories can move faster than a daily batch. A **profile** narrows a run
+to a subset of searches (by category and/or marketplace) and can override the
+threshold, digest cap, and subject line:
+
+```yaml
+profiles:
+  hot:
+    categories: ["Miniatures"]   # only run searches in these categories
+    threshold: 55                # a little more eager
+    subject_prefix: "Hot deals"
+```
+
+```bash
+python -m marketplace_monitor.run --profile hot
+```
+
+The daily sweep and the hourly `hot` run share one seen-store, so an item
+surfaced by either is never reported twice.
+
 ## Scheduling
 
-- **GitHub Actions** (recommended): `.github/workflows/daily.yml` runs the
-  pipeline on a daily cron and can be triggered manually. Put your keys in repo
-  Secrets. Free at this scale.
+- **GitHub Actions** (recommended): `.github/workflows/daily.yml` runs the full
+  sweep on a daily cron; `.github/workflows/hourly.yml` runs the `hot` profile
+  every hour. Both can be triggered manually and share a `concurrency` group so
+  they never race on the shared seen-store. Put your keys in repo Secrets.
 - **Local cron**: `python -m marketplace_monitor.run` on any always-on machine.
 - **Prefect**: `flow.py` wraps the same pipeline in a Prefect flow for per-stage
   observability and Prefect deployments (`pip install "marketplace-monitor[prefect]"`).
