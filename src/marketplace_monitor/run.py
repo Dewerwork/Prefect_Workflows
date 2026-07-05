@@ -76,7 +76,11 @@ def run(
 ) -> RunSummary:
     _load_dotenv()
     cfg = load_config(config_path)
-    logging.getLogger("marketplace_monitor").setLevel(logging.INFO)
+    # Default to INFO for programmatic callers, but don't stomp an explicit
+    # level (e.g. DEBUG set by --verbose in main()).
+    pkg_logger = logging.getLogger("marketplace_monitor")
+    if pkg_logger.level == logging.NOTSET:
+        pkg_logger.setLevel(logging.INFO)
     summary = RunSummary()
 
     profile_cfg = cfg.get_profile(profile) if profile else None
@@ -229,6 +233,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    # Set the package logger explicitly so --verbose reaches the adapter debug logs.
+    logging.getLogger("marketplace_monitor").setLevel(
+        logging.DEBUG if args.verbose else logging.INFO
     )
     _load_dotenv()
 

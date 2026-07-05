@@ -30,9 +30,17 @@ _UA = (
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 )
 _SEARCH_HTML = "https://classifieds.ksl.com/search/"
-# Embedded state the KSL frontend hydrates from.
+# Embedded state the KSL frontend hydrates from. Different builds of the site
+# expose this under different markers, so we try several.
 _STATE_RE = re.compile(r"window\.renderSearchSectionInitialData\s*=\s*(\{.*?\});", re.DOTALL)
-_LISTINGS_RE = re.compile(r'"items"\s*:\s*(\[.*?\])\s*,\s*"', re.DOTALL)
+_NEXT_DATA_RE = re.compile(
+    r'<script[^>]+id="__NEXT_DATA__"[^>]*>(\{.*?\})</script>', re.DOTALL
+)
+_INITIAL_STATE_RE = re.compile(
+    r"window\.__(?:INITIAL_STATE|PRELOADED_STATE|APP_STATE)__\s*=\s*(\{.*?\})\s*;?\s*</script>",
+    re.DOTALL,
+)
+_LISTINGS_RE = re.compile(r'"(?:items|listings|results)"\s*:\s*(\[\{.*?\}\])', re.DOTALL)
 
 
 class KslAdapter(BaseAdapter):
@@ -61,7 +69,17 @@ class KslAdapter(BaseAdapter):
         time.sleep(self._delay)  # gentle rate limiting
         resp = self._session.get(_SEARCH_HTML, params=params, timeout=30)
         resp.raise_for_status()
-        items = _extract_items(resp.text)
+        html = resp.text
+        logger.debug(
+            "[ksl] GET %s -> status=%s len=%d markers: next_data=%s initial_state=%s "
+            "renderSearch=%s listings=%s",
+            resp.url, resp.status_code, len(html),
+            "__NEXT_DATA__" in html,
+            bool(_INITIAL_STATE_RE.search(html)),
+            "renderSearchSection" in html,
+            '"listings"' in html or '"items"' in html,
+        )
+        items = _extract_items(html)
         return [self._to_raw(item, spec) for item in items if item]
 
     def _to_raw(self, item: dict, spec: SearchSpec) -> RawListing | None:
@@ -100,8 +118,33 @@ class KslAdapter(BaseAdapter):
         )
 
 
+def _find_listings(obj) -> list[dict] | None:
+    """Recursively search a decoded JSON blob for the first list of listing-like
+    dicts (objects that have a title/price/id). Handles Next.js/preloaded-state
+    payloads where the listings are nested arbitrarily deep."""
+    if isinstance(obj, list):
+        if obj and isinstance(obj[0], dict) and any(
+            k in obj[0] for k in ("title", "price", "listingId", "id")
+        ) and any(k in obj[0] for k in ("title", "name")):
+            return obj
+        for item in obj:
+            found = _find_listings(item)
+            if found:
+                return found
+    elif isinstance(obj, dict):
+        for key in ("items", "listings", "results", "data"):
+            val = obj.get(key)
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                return val
+        for val in obj.values():
+            found = _find_listings(val)
+            if found:
+                return found
+    return None
+
+
 def _extract_items(html_text: str) -> list[dict]:
-    for regex in (_STATE_RE, _LISTINGS_RE):
+    for regex in (_STATE_RE, _NEXT_DATA_RE, _INITIAL_STATE_RE):
         m = regex.search(html_text)
         if not m:
             continue
@@ -109,12 +152,16 @@ def _extract_items(html_text: str) -> list[dict]:
             payload = json.loads(m.group(1))
         except json.JSONDecodeError:
             continue
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            for key in ("items", "listings", "results"):
-                if isinstance(payload.get(key), list):
-                    return payload[key]
+        found = _find_listings(payload)
+        if found:
+            return found
+    # Last resort: a bare "listings":[...] / "items":[...] array in the HTML.
+    m = _LISTINGS_RE.search(html_text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
     logger.info("[ksl] no embedded listing JSON found (site markup may have changed)")
     return []
 
