@@ -64,19 +64,27 @@ class CraigslistAdapter(BaseAdapter):
 
     def _fetch(self, spec: SearchSpec) -> list[RawListing]:
         import feedparser  # lazy: keeps the package importable without the dep
+        import requests
 
         url = self._build_url(spec)
-        # Craigslist blocks default feed-reader user agents; present as a browser.
-        feed = feedparser.parse(url, agent=_UA)
-        status = getattr(feed, "status", None)
-        logger.debug(
-            "[craigslist] GET %s -> status=%s bozo=%s entries=%d",
-            url, status, getattr(feed, "bozo", None), len(feed.entries),
-        )
-        if getattr(feed, "bozo", 0) and getattr(feed, "bozo_exception", None):
-            logger.debug("[craigslist] parse note: %s", feed.bozo_exception)
+        # Craigslist 403s bare feed-reader requests. Fetch through requests with
+        # a full browser header set, then hand the bytes to feedparser.
+        headers = {
+            "User-Agent": _UA,
+            "Accept": "application/rss+xml,application/xml,text/xml,text/html;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://{self.site}.craigslist.org/",
+            "Connection": "keep-alive",
+        }
+        resp = requests.get(url, headers=headers, timeout=30)
+        logger.debug("[craigslist] GET %s -> status=%s len=%d",
+                     url, resp.status_code, len(resp.content))
+        if resp.status_code != 200:
+            logger.info("[craigslist] status %s for %s", resp.status_code, url)
+            return []
+        feed = feedparser.parse(resp.content)
         if not feed.entries:
-            logger.info("[craigslist] 0 entries (status=%s) for %s", status, url)
+            logger.info("[craigslist] 0 entries (status 200) for %s", url)
         out: list[RawListing] = []
         for entry in feed.entries:
             link = entry.get("link", "")

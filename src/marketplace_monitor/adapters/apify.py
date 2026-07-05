@@ -34,6 +34,10 @@ def run_apify_actor(actor_id: str, run_input: dict, timeout_secs: int = 300) -> 
     )
     resp.raise_for_status()
     data = resp.json()
-    if isinstance(data, list):
-        return data
-    return data.get("items", []) if isinstance(data, dict) else []
+    items = data if isinstance(data, list) else (
+        data.get("items", []) if isinstance(data, dict) else []
+    )
+    logger.info("apify actor %s returned %d item(s)", actor_id, len(items))
+    if items and isinstance(items[0], dict):
+        logger.debug("apify actor %s first-item keys: %s", actor_id, sorted(items[0].keys()))
+    return items
