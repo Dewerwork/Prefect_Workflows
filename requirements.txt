@@ -3,6 +3,7 @@ anthropic>=0.49            # Claude Haiku scorer (section 8)
 requests>=2.31            # eBay Browse API, KSL HTTP, OfferUp, Apify, Resend
 feedparser>=6.0           # Craigslist RSS (section 5.2)
 PyYAML>=6.0               # config.yaml
+python-dotenv>=1.0        # load a local .env for keys (optional but convenient)
 
 # Optional — only needed for specific backends:
 # libsql-experimental>=0.0.37   # Turso/libSQL seen-store in CI (section 10.3)
