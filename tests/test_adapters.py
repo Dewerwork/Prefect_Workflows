@@ -188,16 +188,17 @@ def test_craigslist_apify_mode(monkeypatch):
     monkeypatch.setattr(craigslist, "run_apify_actor", fake_actor)
     adapter = craigslist.CraigslistAdapter(
         location=LOC,
-        options={"mode": "apify", "apify_actor": "u/cl", "site": "boise", "section": "sss"},
+        options={"mode": "apify", "apify_actor": "u/cl", "site": "boise",
+                 "section": "sss", "max_items": 50},
     )
-    out = adapter.fetch([SearchSpec(query="cast iron", category="Tools")])
+    out = adapter.fetch([SearchSpec(query="cast iron", category="Tools", max_price=40)])
     assert len(out) == 1
     assert out[0].price == 40.0 and out[0].location == "Nampa"
     assert out[0].category == "Tools"
     # Input must match the actor's real schema.
     assert captured["input"] == {
-        "searchQueries": ["cast iron"], "city": "boise",
-        "category": "sss", "scrapeDetails": False,
+        "searchQueries": ["cast iron"], "city": "boise", "category": "sss",
+        "maxListings": 50, "scrapeDetails": False, "maxPrice": 40,
     }
     assert captured["actor"] == "u/cl"
 

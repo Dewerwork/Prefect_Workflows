@@ -57,6 +57,7 @@ class CraigslistAdapter(BaseAdapter):
             self.mode = "playwright" if self.options.get("use_playwright") else "rss"
         self.apify_actor = self.options.get("apify_actor", "")
         self.scrape_details = bool(self.options.get("scrape_details", False))
+        self.max_items = int(self.options.get("max_items", 50))
         self._session = None
         self._browser_tls = False
         self._warmed = False
@@ -80,14 +81,20 @@ class CraigslistAdapter(BaseAdapter):
         if not self.apify_actor:
             logger.info("[craigslist] mode=apify but no apify_actor configured; skipping")
             return []
-        # Input shape for the Craigslist Apify actor (verified schema):
-        #   searchQueries (list), city, category (CL section), scrapeDetails.
+        # Input shape for lulzasaur/craigslist-scraper (verified schema):
+        #   searchQueries (list), city, category (CL section), maxListings,
+        #   scrapeDetails, minPrice, maxPrice.
         run_input = {
             "searchQueries": [spec.query],
             "city": self.site,
             "category": spec.extra.get("section", self.section),
+            "maxListings": self.max_items,
             "scrapeDetails": self.scrape_details,
         }
+        if spec.max_price is not None:
+            run_input["maxPrice"] = spec.max_price
+        if spec.min_price is not None:
+            run_input["minPrice"] = spec.min_price
         run_input.update(self.options.get("extra_input", {}))
         items = run_apify_actor(self.apify_actor, run_input)
         return [self._to_raw_apify(item, spec) for item in items if item]
