@@ -90,11 +90,13 @@ def test_craigslist_parses_rss(monkeypatch):
     )
     fake_module = types.SimpleNamespace(parse=lambda src, **kw: fake_feed)
     monkeypatch.setitem(__import__("sys").modules, "feedparser", fake_module)
-    import requests
-    monkeypatch.setattr(requests, "get",
-                        lambda *a, **k: FakeResponse(status_code=200, content=b"<rss/>"))
+
+    class FakeSession:
+        def get(self, *a, **k):
+            return FakeResponse(status_code=200, content=b"<rss/>")
 
     adapter = craigslist.CraigslistAdapter(location=LOC, options={"site": "boise"})
+    adapter._session = FakeSession()  # skip real session creation + warm-up
     out = adapter.fetch([SearchSpec(query="cast iron", max_price=40)])
     assert len(out) == 1
     item = out[0]
