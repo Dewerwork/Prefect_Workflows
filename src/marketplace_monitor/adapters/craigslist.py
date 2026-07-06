@@ -16,6 +16,7 @@ import re
 from datetime import datetime
 
 from ..models import RawListing, SearchSpec
+from .apify import run_apify_actor
 from .base import BaseAdapter
 
 logger = logging.getLogger(__name__)
@@ -46,18 +47,76 @@ class CraigslistAdapter(BaseAdapter):
         self.fetch_body = bool(self.options.get("fetch_body", False))
         self.max_body_fetches = int(self.options.get("max_body_fetches", 20))
         self.body_delay = float(self.options.get("body_delay_seconds", 1.0))
-        # Craigslist hard-blocks plain HTTP (even browser-TLS) with a JS
-        # challenge. Set use_playwright: true to drive a real Chromium that
-        # clears the challenge, then loads the feed.
-        self.use_playwright = bool(self.options.get("use_playwright", False))
+        # Fetch mode. Craigslist hard-blocks plain HTTP (even browser-TLS) with a
+        # JS challenge, so the practical options are:
+        #   "apify"      — an Apify Craigslist actor (reliable; needs apify_actor)
+        #   "playwright" — a headless Chromium that clears the challenge
+        #   "rss"        — plain HTTP RSS (works only if CL ever relaxes)
+        self.mode = self.options.get("mode")
+        if not self.mode:
+            self.mode = "playwright" if self.options.get("use_playwright") else "rss"
+        self.apify_actor = self.options.get("apify_actor", "")
+        self.scrape_details = bool(self.options.get("scrape_details", False))
         self._session = None
         self._browser_tls = False
         self._warmed = False
 
+    @classmethod
+    def required_env(cls, options=None):
+        options = options or {}
+        return ["APIFY_TOKEN"] if options.get("mode") == "apify" else []
+
     def fetch(self, queries: list[SearchSpec]) -> list[RawListing]:
-        if self.use_playwright:
+        if self.mode == "playwright":
             return self._fetch_all_playwright(queries)
-        return super().fetch(queries)
+        return super().fetch(queries)  # rss / apify handled per-search in _fetch
+
+    def _fetch(self, spec: SearchSpec) -> list[RawListing]:
+        if self.mode == "apify":
+            return self._fetch_apify(spec)
+        return self._fetch_rss(spec)
+
+    def _fetch_apify(self, spec: SearchSpec) -> list[RawListing]:
+        if not self.apify_actor:
+            logger.info("[craigslist] mode=apify but no apify_actor configured; skipping")
+            return []
+        # Input shape for the Craigslist Apify actor (verified schema):
+        #   searchQueries (list), city, category (CL section), scrapeDetails.
+        run_input = {
+            "searchQueries": [spec.query],
+            "city": self.site,
+            "category": spec.extra.get("section", self.section),
+            "scrapeDetails": self.scrape_details,
+        }
+        run_input.update(self.options.get("extra_input", {}))
+        items = run_apify_actor(self.apify_actor, run_input)
+        return [self._to_raw_apify(item, spec) for item in items if item]
+
+    def _to_raw_apify(self, item: dict, spec: SearchSpec) -> RawListing | None:
+        title = item.get("title") or item.get("name") or ""
+        url = item.get("url") or item.get("link") or ""
+        if not title or not url:
+            return None
+        price = _extract_price(str(item.get("price"))) if item.get("price") is not None else None
+        loc = item.get("location") or item.get("locality") or item.get("hood") or self.site
+        if isinstance(loc, dict):
+            loc = loc.get("city") or loc.get("name")
+        image = item.get("image") or item.get("imageUrl") or item.get("thumbnail")
+        if isinstance(image, list) and image:
+            image = image[0]
+        return RawListing(
+            source=self.name,
+            source_id=item.get("id") or item.get("pid") or _extract_id(url),
+            title=title,
+            url=url,
+            price=price,
+            location=loc if isinstance(loc, str) else None,
+            posted_at=_parse_date(item.get("datetime") or item.get("postedAt") or item.get("date")),
+            description=item.get("description") or item.get("body"),
+            image_url=image if isinstance(image, str) else None,
+            category=spec.category,
+            raw=item,
+        )
 
     def _fetch_all_playwright(self, queries: list[SearchSpec]) -> list[RawListing]:
         """Drive one headless Chromium across all searches: navigate to the
@@ -150,7 +209,7 @@ class CraigslistAdapter(BaseAdapter):
         self._warmed = True
         return self._session
 
-    def _fetch(self, spec: SearchSpec) -> list[RawListing]:
+    def _fetch_rss(self, spec: SearchSpec) -> list[RawListing]:
         url = self._build_url(spec)
         headers = {
             "Accept": "application/rss+xml,application/xml,text/xml,text/html;q=0.9,*/*;q=0.8",

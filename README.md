@@ -110,10 +110,12 @@ locally or GitHub Actions Secrets in CI — they never live in the repo.
 | Email (SMTP) | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD` | `delivery.method: smtp` |
 | CI state store | `STORE_URL`, `STORE_AUTH_TOKEN` | Turso seen-store in CI |
 
-Craigslist and KSL need no credentials. **Craigslist** does need a headless
-browser to clear its bot challenge (`use_playwright: true`, on by default):
-`pip install playwright && python -m playwright install chromium`. Without it,
-Craigslist logs a hint and is skipped; the rest of the run is unaffected.
+KSL needs no credentials. **Craigslist** hard-blocks plain HTTP with a bot
+challenge, so it runs in one of two modes (set `mode:` in its config):
+`apify` (default — reliable, needs `APIFY_TOKEN` + an actor id) or `playwright`
+(free, drives a headless Chromium — `pip install playwright && python -m
+playwright install chromium`). Either way it degrades gracefully to nothing if
+unconfigured.
 
 ## Instant alerts (optional)
 
