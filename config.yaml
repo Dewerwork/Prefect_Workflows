@@ -93,11 +93,11 @@ marketplaces:
     enabled: true
     options:
       mode: "apify"            # apify | playwright | rss
-      # PASTE THE ACTOR ID from its apify.com URL, e.g. "someuser/craigslist-scraper"
-      apify_actor: ""
+      apify_actor: "lulzasaur/craigslist-scraper"
       site: "boise"            # -> city in the actor input (covers Caldwell/Nampa/Meridian)
       section: "sss"           # -> category in the actor input (all for-sale)
-      scrape_details: false    # true adds descriptions but costs more per result
+      max_items: 50            # -> maxListings per search
+      scrape_details: false    # true adds descriptions/location but costs more per result
       extra_input: {}          # merged/overrides actor input if needed
     searches:
       - query: "cast iron"
