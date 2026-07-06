@@ -5,7 +5,7 @@
 
 location:
   label: "Caldwell, ID"
-  zip_code: "83605"
+  zip_code: "83607"
   radius_mi: 40          # covers Boise / Nampa / Meridian
   # Optional lat/long if an adapter wants exact coordinates.
   latitude: 43.6629

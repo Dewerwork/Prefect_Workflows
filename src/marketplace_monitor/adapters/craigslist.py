@@ -46,6 +46,9 @@ class CraigslistAdapter(BaseAdapter):
         self.fetch_body = bool(self.options.get("fetch_body", False))
         self.max_body_fetches = int(self.options.get("max_body_fetches", 20))
         self.body_delay = float(self.options.get("body_delay_seconds", 1.0))
+        self._session = None
+        self._browser_tls = False
+        self._warmed = False
 
     def _build_url(self, spec: SearchSpec) -> str:
         section = spec.extra.get("section", self.section)
@@ -62,31 +65,60 @@ class CraigslistAdapter(BaseAdapter):
             params.append(f"postal={zip_code}")
         return base + "?" + "&".join(params)
 
+    def _get_session(self):
+        """Lazily create a browser-TLS session (curl_cffi) and warm it up on the
+        region homepage so Craigslist sets its cookies before we fetch the feed.
+        Falls back to requests when curl_cffi isn't installed."""
+        if self._session is not None:
+            return self._session
+        try:
+            from curl_cffi import requests as cffi
+
+            self._session = cffi.Session(impersonate="chrome")
+            self._browser_tls = True
+        except ImportError:
+            import requests
+
+            self._session = requests.Session()
+            self._session.headers.update({"User-Agent": _UA})
+            self._browser_tls = False
+        # Warm up cookies from the homepage (best-effort).
+        try:
+            self._session.get(f"https://{self.site}.craigslist.org/", timeout=20)
+        except Exception:  # noqa: BLE001
+            pass
+        self._warmed = True
+        return self._session
+
     def _fetch(self, spec: SearchSpec) -> list[RawListing]:
         import feedparser  # lazy: keeps the package importable without the dep
 
         url = self._build_url(spec)
         headers = {
-            "User-Agent": _UA,
             "Accept": "application/rss+xml,application/xml,text/xml,text/html;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": f"https://{self.site}.craigslist.org/",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
+            "Referer": f"https://{self.site}.craigslist.org/search/{spec.extra.get('section', self.section)}",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
-            "Upgrade-Insecure-Requests": "1",
         }
-        status, content, impersonated = _fetch_url(url, headers)
+        session = self._get_session()
+        resp = session.get(url, headers=headers, timeout=30)
+        status = resp.status_code
+        content = resp.content
         logger.debug("[craigslist] GET %s -> status=%s len=%d (browser-tls=%s)",
-                     url, status, len(content or b""), impersonated)
+                     url, status, len(content or b""), self._browser_tls)
         if status != 200:
-            if status == 403 and not impersonated:
+            if status == 403 and not self._browser_tls:
                 logger.info(
                     "[craigslist] 403 (TLS fingerprint block). Install curl_cffi "
                     "(pip install curl_cffi) to fetch with a real browser TLS handshake."
                 )
             else:
-                logger.info("[craigslist] status %s for %s", status, url)
+                logger.info(
+                    "[craigslist] status %s for %s (browser-tls=%s)",
+                    status, url, self._browser_tls,
+                )
             return []
         feed = feedparser.parse(content)
         if not feed.entries:
@@ -163,27 +195,6 @@ def _extract_body(html_text: str) -> str | None:
     text = _TAG_RE.sub(" ", m.group(1))
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
-
-
-def _fetch_url(url: str, headers: dict) -> tuple[int, bytes, bool]:
-    """Fetch a URL, preferring a real-browser TLS handshake.
-
-    Craigslist blocks Python's default TLS fingerprint (a 403 before headers
-    even matter). ``curl_cffi`` impersonates Chrome's TLS stack and gets through;
-    if it isn't installed we fall back to plain ``requests`` (which will likely
-    403, but works if Craigslist ever relaxes). Returns
-    ``(status_code, content_bytes, used_browser_tls)``.
-    """
-    try:
-        from curl_cffi import requests as cffi
-
-        resp = cffi.get(url, headers=headers, impersonate="chrome", timeout=30)
-        return resp.status_code, resp.content, True
-    except ImportError:
-        import requests
-
-        resp = requests.get(url, headers=headers, timeout=30)
-        return resp.status_code, resp.content, False
 
 
 def requests_quote(text: str) -> str:
