@@ -72,11 +72,14 @@ class KslAdapter(BaseAdapter):
         resp = self._session.get(url, timeout=30)
         resp.raise_for_status()
         html = resp.text
-        items = _extract_results(html)
-        logger.debug("[ksl] GET %s -> status=%s len=%d results=%d",
-                     resp.url, resp.status_code, len(html), len(items))
+        items, saw_flight = _extract_results(html)
+        logger.debug("[ksl] GET %s -> status=%s len=%d results=%d flight=%s",
+                     resp.url, resp.status_code, len(html), len(items), saw_flight)
         if not items:
-            logger.info("[ksl] no results parsed from %s (markup may have changed)", url)
+            if saw_flight:
+                logger.info("[ksl] 0 results for '%s' (no local matches)", spec.query)
+            else:
+                logger.info("[ksl] no flight data in %s (markup may have changed)", url)
         return [self._to_raw(item, spec) for item in items if item]
 
     def _to_raw(self, item: dict, spec: SearchSpec) -> RawListing | None:
@@ -116,8 +119,12 @@ class KslAdapter(BaseAdapter):
         )
 
 
-def _extract_results(html_text: str) -> list[dict]:
+def _extract_results(html_text: str) -> tuple[list[dict], bool]:
     """Pull the listings out of KSL's Next.js flight data.
+
+    Returns ``(listings, saw_results_key)`` — the second flag distinguishes "the
+    search genuinely had 0 matches" (flight data present, empty results) from
+    "the page markup changed / was blocked" (no results key at all).
 
     The flight payload is split across many ``self.__next_f.push([1, "..."])``
     calls. We JSON-decode each string chunk (which un-escapes it), concatenate
@@ -132,9 +139,10 @@ def _extract_results(html_text: str) -> list[dict]:
             continue
     flight = "".join(parts)
     if not flight:
-        return []
+        return [], False
 
     key = '"results":'
+    saw_key = key in flight
     idx = flight.find(key)
     while idx != -1:
         bracket = flight.find("[", idx + len(key))
@@ -148,9 +156,9 @@ def _extract_results(html_text: str) -> list[dict]:
                 results = None
             listings = _flatten(results)
             if listings:
-                return listings
+                return listings, True
         idx = flight.find(key, idx + len(key))
-    return []
+    return [], saw_key
 
 
 def _match_brackets(s: str, start: int) -> str | None:
