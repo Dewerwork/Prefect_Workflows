@@ -6,5 +6,6 @@ PyYAML>=6.0               # config.yaml
 python-dotenv>=1.0        # load a local .env for keys (optional but convenient)
 
 # Optional — only needed for specific backends:
+# curl_cffi>=0.7                # browser-TLS fetch for Craigslist (bypasses its 403)
 # libsql-experimental>=0.0.37   # Turso/libSQL seen-store in CI (section 10.3)
 # prefect>=3.0                  # run the pipeline as a Prefect flow (flow.py)

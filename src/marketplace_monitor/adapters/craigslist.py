@@ -64,25 +64,31 @@ class CraigslistAdapter(BaseAdapter):
 
     def _fetch(self, spec: SearchSpec) -> list[RawListing]:
         import feedparser  # lazy: keeps the package importable without the dep
-        import requests
 
         url = self._build_url(spec)
-        # Craigslist 403s bare feed-reader requests. Fetch through requests with
-        # a full browser header set, then hand the bytes to feedparser.
         headers = {
             "User-Agent": _UA,
             "Accept": "application/rss+xml,application/xml,text/xml,text/html;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": f"https://{self.site}.craigslist.org/",
-            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Upgrade-Insecure-Requests": "1",
         }
-        resp = requests.get(url, headers=headers, timeout=30)
-        logger.debug("[craigslist] GET %s -> status=%s len=%d",
-                     url, resp.status_code, len(resp.content))
-        if resp.status_code != 200:
-            logger.info("[craigslist] status %s for %s", resp.status_code, url)
+        status, content, impersonated = _fetch_url(url, headers)
+        logger.debug("[craigslist] GET %s -> status=%s len=%d (browser-tls=%s)",
+                     url, status, len(content or b""), impersonated)
+        if status != 200:
+            if status == 403 and not impersonated:
+                logger.info(
+                    "[craigslist] 403 (TLS fingerprint block). Install curl_cffi "
+                    "(pip install curl_cffi) to fetch with a real browser TLS handshake."
+                )
+            else:
+                logger.info("[craigslist] status %s for %s", status, url)
             return []
-        feed = feedparser.parse(resp.content)
+        feed = feedparser.parse(content)
         if not feed.entries:
             logger.info("[craigslist] 0 entries (status 200) for %s", url)
         out: list[RawListing] = []
@@ -157,6 +163,27 @@ def _extract_body(html_text: str) -> str | None:
     text = _TAG_RE.sub(" ", m.group(1))
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
+
+
+def _fetch_url(url: str, headers: dict) -> tuple[int, bytes, bool]:
+    """Fetch a URL, preferring a real-browser TLS handshake.
+
+    Craigslist blocks Python's default TLS fingerprint (a 403 before headers
+    even matter). ``curl_cffi`` impersonates Chrome's TLS stack and gets through;
+    if it isn't installed we fall back to plain ``requests`` (which will likely
+    403, but works if Craigslist ever relaxes). Returns
+    ``(status_code, content_bytes, used_browser_tls)``.
+    """
+    try:
+        from curl_cffi import requests as cffi
+
+        resp = cffi.get(url, headers=headers, impersonate="chrome", timeout=30)
+        return resp.status_code, resp.content, True
+    except ImportError:
+        import requests
+
+        resp = requests.get(url, headers=headers, timeout=30)
+        return resp.status_code, resp.content, False
 
 
 def requests_quote(text: str) -> str:

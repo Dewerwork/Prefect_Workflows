@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+craigslist = ["curl_cffi>=0.7"]
 turso = ["libsql-experimental>=0.0.37"]
 prefect = ["prefect>=3.0"]
 dev = ["pytest>=8.0"]
