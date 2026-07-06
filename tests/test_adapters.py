@@ -8,11 +8,13 @@ from marketplace_monitor.config import LocationConfig
 
 
 class FakeResponse:
-    def __init__(self, json_data=None, text="", url="https://example.test/", status_code=200):
+    def __init__(self, json_data=None, text="", url="https://example.test/",
+                 status_code=200, content=b""):
         self._json = json_data
         self.text = text
         self.url = url
         self.status_code = status_code
+        self.content = content
 
     def raise_for_status(self):
         pass
@@ -86,8 +88,11 @@ def test_craigslist_parses_rss(monkeypatch):
             }
         ]
     )
-    fake_module = types.SimpleNamespace(parse=lambda url, **kw: fake_feed)
+    fake_module = types.SimpleNamespace(parse=lambda src, **kw: fake_feed)
     monkeypatch.setitem(__import__("sys").modules, "feedparser", fake_module)
+    import requests
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: FakeResponse(status_code=200, content=b"<rss/>"))
 
     adapter = craigslist.CraigslistAdapter(location=LOC, options={"site": "boise"})
     out = adapter.fetch([SearchSpec(query="cast iron", max_price=40)])
@@ -107,30 +112,55 @@ def test_craigslist_price_extraction():
 
 # --- KSL --------------------------------------------------------------------
 
-def test_ksl_extracts_embedded_json(monkeypatch):
+def _ksl_flight_html(listings):
+    """Build a KSL v2 page the way Next.js renders it: the results embedded in a
+    self.__next_f.push([1, "<json-escaped flight string>"]) script."""
+    import json
+
+    inner = {"initialState": {"results": [listings], "pageInfo": [{"total": len(listings)}]}}
+    flight_str = '2a:["$","$L2b",null,' + json.dumps(inner) + "]"
+    push = "self.__next_f.push([1, " + json.dumps(flight_str) + "])"
+    return f"<html><body><script>{push}</script></body></html>"
+
+
+def test_ksl_extracts_flight_results(monkeypatch):
     from marketplace_monitor.adapters import ksl
     from marketplace_monitor.models import SearchSpec
 
-    html = (
-        "<html><script>window.renderSearchSectionInitialData = "
-        '{"items":[{"id":"9988","title":"Presto pressure canner",'
-        '"price":45,"city":"Meridian","state":"ID",'
-        '"url":"/listing/9988"}]};</script></html>'
-    )
+    listing = {
+        "id": 81585559, "title": "Small folding pedestal table - Butcher block top",
+        "price": 45, "location": {"city": "Boise", "state": "ID", "zip": "83713"},
+        "primaryImage": {"url": "https://image.ksldigital.com/x.jpg"},
+        "createdAt": 1783187422, "category": "Furniture",
+    }
+    html = _ksl_flight_html([listing])
     monkeypatch.setattr(ksl.time, "sleep", lambda *a, **k: None)
 
     adapter = ksl.KslAdapter(location=LOC)
-    monkeypatch.setattr(adapter._session, "get", lambda *a, **k: FakeResponse(text=html))
-    out = adapter.fetch([SearchSpec(query="pressure canner")])
+    monkeypatch.setattr(adapter._session, "get",
+                        lambda *a, **k: FakeResponse(text=html, url="https://classifieds.ksl.com/v2/search"))
+    out = adapter.fetch([SearchSpec(query="table")])
     assert len(out) == 1
     item = out[0]
-    assert item.source_id == "9988"
+    assert item.source_id == "81585559"
     assert item.price == 45.0
-    assert item.url == "https://classifieds.ksl.com/listing/9988"
-    assert item.location == "Meridian, ID"
+    assert item.url == "https://classifieds.ksl.com/listing/81585559"
+    assert item.location == "Boise, ID"
+    assert item.image_url == "https://image.ksldigital.com/x.jpg"
+    assert item.category == "Furniture"
+    assert item.posted_at is not None
 
 
-def test_ksl_no_json_returns_empty(monkeypatch):
+def test_ksl_builds_v2_url(monkeypatch):
+    from marketplace_monitor.adapters import ksl
+    from marketplace_monitor.models import SearchSpec
+
+    adapter = ksl.KslAdapter(location=LOC)
+    url = adapter._build_url(SearchSpec(query="cast iron"))
+    assert url == "https://classifieds.ksl.com/v2/search/keyword/cast+iron/zip/83605/miles/40"
+
+
+def test_ksl_no_results_returns_empty(monkeypatch):
     from marketplace_monitor.adapters import ksl
     from marketplace_monitor.models import SearchSpec
 

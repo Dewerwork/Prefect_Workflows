@@ -61,6 +61,22 @@ def test_to_listing_coerces_bad_price():
     assert to_listing(raw).price is None
 
 
+def test_to_listing_coerces_dict_location_and_image():
+    # Facebook's actor returns location/image as nested objects, not strings.
+    raw = RawListing(
+        source="facebook", source_id="1", title="cast iron", url="http://x",
+        location={"text": "Boise, ID", "reverse_geocode": {"city": "Boise"}},
+        image_url={"uri": "https://img/1.jpg"},
+    )
+    listing = to_listing(raw)
+    assert listing.location == "Boise, ID"
+    assert listing.image_url == "https://img/1.jpg"
+    # And it must render without raising (regression: dict.replace crash).
+    from marketplace_monitor.report import RunSummary, render_html
+    from marketplace_monitor.models import ScoredListing
+    render_html([ScoredListing(listing=listing, score=90, reason="ok")], RunSummary())
+
+
 # --- prefilter --------------------------------------------------------------
 
 def test_prefilter_price_ceiling():
