@@ -104,7 +104,7 @@ class CraigslistAdapter(BaseAdapter):
         url = item.get("url") or item.get("link") or ""
         if not title or not url:
             return None
-        price = _extract_price(str(item.get("price"))) if item.get("price") is not None else None
+        price = _coerce_price(item.get("price"))
         loc = item.get("location") or item.get("locality") or item.get("hood") or self.site
         if isinstance(loc, dict):
             loc = loc.get("city") or loc.get("name")
@@ -340,6 +340,21 @@ def _extract_price(text: str | None) -> float | None:
         return None
     try:
         return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _coerce_price(value) -> float | None:
+    """Parse a price that may be a number, a "$40" string, or a bare "40"."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    m = re.search(r"[0-9][0-9,]*(?:\.[0-9]+)?", str(value))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
     except ValueError:
         return None
 
