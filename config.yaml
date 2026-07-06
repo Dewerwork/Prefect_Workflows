@@ -92,8 +92,9 @@ marketplaces:
   - name: craigslist
     enabled: true
     options:
-      site: "boise"            # -> boise.craigslist.org
+      site: "boise"            # -> boise.craigslist.org (covers Caldwell/Nampa/Meridian)
       section: "sss"           # all for-sale
+      use_playwright: true     # drive headless Chromium to pass CL's bot challenge
       fetch_body: false        # opt-in: fetch listing bodies for borderline items
       max_body_fetches: 20     # cap page fetches per run when fetch_body is on
     searches:

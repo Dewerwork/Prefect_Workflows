@@ -112,6 +112,85 @@ def test_craigslist_price_extraction():
     assert _extract_price("no price here") is None
 
 
+def test_craigslist_playwright_path(monkeypatch):
+    import sys
+
+    from marketplace_monitor.adapters import craigslist
+    from marketplace_monitor.models import SearchSpec
+
+    # Fake feedparser: return one entry.
+    fake_feed = types.SimpleNamespace(entries=[{
+        "link": "https://boise.craigslist.org/tls/98765.html",
+        "title": "Cast iron dutch oven - $35 (Nampa)",
+        "summary": "Lodge 5qt",
+        "published": "2026-07-05T09:00:00+00:00",
+        "enclosures": [],
+    }])
+    monkeypatch.setitem(sys.modules, "feedparser",
+                        types.SimpleNamespace(parse=lambda src, **kw: fake_feed))
+
+    # Fake Playwright chain: page.goto -> response with .status / .body().
+    class FakeResp:
+        status = 200
+
+        def body(self):
+            return b"<rss/>"
+
+    class FakePage:
+        def goto(self, url, **kw):
+            return FakeResp()
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class FakeBrowser:
+        def new_context(self, **kw):
+            return types.SimpleNamespace(new_page=lambda: FakePage())
+
+        def close(self):
+            pass
+
+    class FakePW:
+        chromium = types.SimpleNamespace(launch=lambda **kw: FakeBrowser())
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake_sync_api = types.SimpleNamespace(sync_playwright=lambda: FakePW())
+    monkeypatch.setitem(sys.modules, "playwright", types.SimpleNamespace(sync_api=fake_sync_api))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync_api)
+
+    adapter = craigslist.CraigslistAdapter(
+        location=LOC, options={"site": "boise", "use_playwright": True}
+    )
+    out = adapter.fetch([SearchSpec(query="cast iron", max_price=40)])
+    assert len(out) == 1
+    assert out[0].source_id == "98765"
+    assert out[0].price == 35.0
+
+
+def test_craigslist_playwright_missing_dep_returns_empty(monkeypatch):
+    import builtins
+
+    from marketplace_monitor.adapters import craigslist
+    from marketplace_monitor.models import SearchSpec
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name.startswith("playwright"):
+            raise ImportError("no playwright")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    adapter = craigslist.CraigslistAdapter(location=LOC, options={"use_playwright": True})
+    # Missing Playwright -> graceful [] (never aborts the run).
+    assert adapter.fetch([SearchSpec(query="x")]) == []
+
+
 # --- KSL --------------------------------------------------------------------
 
 def _ksl_flight_html(listings):

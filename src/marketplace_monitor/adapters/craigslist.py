@@ -46,9 +46,69 @@ class CraigslistAdapter(BaseAdapter):
         self.fetch_body = bool(self.options.get("fetch_body", False))
         self.max_body_fetches = int(self.options.get("max_body_fetches", 20))
         self.body_delay = float(self.options.get("body_delay_seconds", 1.0))
+        # Craigslist hard-blocks plain HTTP (even browser-TLS) with a JS
+        # challenge. Set use_playwright: true to drive a real Chromium that
+        # clears the challenge, then loads the feed.
+        self.use_playwright = bool(self.options.get("use_playwright", False))
         self._session = None
         self._browser_tls = False
         self._warmed = False
+
+    def fetch(self, queries: list[SearchSpec]) -> list[RawListing]:
+        if self.use_playwright:
+            return self._fetch_all_playwright(queries)
+        return super().fetch(queries)
+
+    def _fetch_all_playwright(self, queries: list[SearchSpec]) -> list[RawListing]:
+        """Drive one headless Chromium across all searches: navigate to the
+        region homepage first so the JS bot-challenge resolves and sets its
+        clearance cookie, then fetch each search's RSS feed within that same
+        browser context (which now carries the cookie)."""
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.warning(
+                "[craigslist] use_playwright is set but Playwright isn't installed. "
+                "Run: pip install playwright && python -m playwright install chromium"
+            )
+            return []
+
+        results: list[RawListing] = []
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(user_agent=_UA, locale="en-US")
+                page = context.new_page()
+                # Warm up: clear the challenge on the homepage.
+                try:
+                    page.goto(f"https://{self.site}.craigslist.org/",
+                              wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(1500)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[craigslist] warm-up navigation note: %s", exc)
+
+                for spec in queries:
+                    try:
+                        found = self._fetch_one_playwright(page, spec)
+                        logger.info("[craigslist] '%s' -> %d listings", spec.query, len(found))
+                        results.extend(found)
+                    except Exception as exc:  # noqa: BLE001 - per-search isolation
+                        logger.warning("[craigslist] search '%s' failed: %s", spec.query, exc)
+                browser.close()
+        except Exception as exc:  # noqa: BLE001 - never abort the run
+            logger.warning("[craigslist] playwright fetch failed: %s", exc)
+        return results
+
+    def _fetch_one_playwright(self, page, spec: SearchSpec) -> list[RawListing]:
+        url = self._build_url(spec)
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        status = resp.status if resp else None
+        body = resp.body() if resp else b""
+        logger.debug("[craigslist] (pw) GET %s -> status=%s len=%d", url, status, len(body or b""))
+        if status != 200:
+            logger.info("[craigslist] (pw) status %s for %s", status, url)
+            return []
+        return self._parse_feed(body, spec)
 
     def _build_url(self, spec: SearchSpec) -> str:
         section = spec.extra.get("section", self.section)
@@ -91,8 +151,6 @@ class CraigslistAdapter(BaseAdapter):
         return self._session
 
     def _fetch(self, spec: SearchSpec) -> list[RawListing]:
-        import feedparser  # lazy: keeps the package importable without the dep
-
         url = self._build_url(spec)
         headers = {
             "Accept": "application/rss+xml,application/xml,text/xml,text/html;q=0.9,*/*;q=0.8",
@@ -120,9 +178,15 @@ class CraigslistAdapter(BaseAdapter):
                     status, url, self._browser_tls,
                 )
             return []
-        feed = feedparser.parse(content)
-        if not feed.entries:
+        out = self._parse_feed(content, spec)
+        if not out:
             logger.info("[craigslist] 0 entries (status 200) for %s", url)
+        return out
+
+    def _parse_feed(self, content, spec: SearchSpec) -> list[RawListing]:
+        import feedparser
+
+        feed = feedparser.parse(content)
         out: list[RawListing] = []
         for entry in feed.entries:
             link = entry.get("link", "")
@@ -151,7 +215,6 @@ class CraigslistAdapter(BaseAdapter):
                 )
             )
         return out
-
 
     def enrich(self, listings: list) -> None:
         """Fetch listing-page bodies for items still missing a description.
