@@ -33,8 +33,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install playwright        # Craigslist headless-browser fetch
-          python -m playwright install --with-deps chromium
 
       - name: Run hot-category digest
         env:

@@ -172,6 +172,44 @@ def test_craigslist_playwright_path(monkeypatch):
     assert out[0].price == 35.0
 
 
+def test_craigslist_apify_mode(monkeypatch):
+    from marketplace_monitor.adapters import craigslist
+    from marketplace_monitor.models import SearchSpec
+
+    captured = {}
+    items = [{"title": "Cast iron skillet", "price": "$40", "url": "https://boise.craigslist.org/tls/5.html",
+              "location": "Nampa", "imageUrl": "https://img/5.jpg"}]
+
+    def fake_actor(actor, run_input):
+        captured["actor"] = actor
+        captured["input"] = run_input
+        return items
+
+    monkeypatch.setattr(craigslist, "run_apify_actor", fake_actor)
+    adapter = craigslist.CraigslistAdapter(
+        location=LOC,
+        options={"mode": "apify", "apify_actor": "u/cl", "site": "boise", "section": "sss"},
+    )
+    out = adapter.fetch([SearchSpec(query="cast iron", category="Tools")])
+    assert len(out) == 1
+    assert out[0].price == 40.0 and out[0].location == "Nampa"
+    assert out[0].category == "Tools"
+    # Input must match the actor's real schema.
+    assert captured["input"] == {
+        "searchQueries": ["cast iron"], "city": "boise",
+        "category": "sss", "scrapeDetails": False,
+    }
+    assert captured["actor"] == "u/cl"
+
+
+def test_craigslist_apify_no_actor_returns_empty(monkeypatch):
+    from marketplace_monitor.adapters import craigslist
+    from marketplace_monitor.models import SearchSpec
+
+    adapter = craigslist.CraigslistAdapter(location=LOC, options={"mode": "apify", "apify_actor": ""})
+    assert adapter.fetch([SearchSpec(query="x")]) == []
+
+
 def test_craigslist_playwright_missing_dep_returns_empty(monkeypatch):
     import builtins
 
